@@ -393,7 +393,7 @@ class KaggleRunner(JobRunner):
                 if state in ("complete", "completed"):
                     remote_finished = True
                     break
-                if state in ("error", "failed", "cancelled", "canceled"):
+                if state in ("error", "failed", "cancelled", "canceled", "cancel_acknowledged"):
                     remote_finished = True
                     message = getattr(response, "failure_message", "")
                     if not message:
