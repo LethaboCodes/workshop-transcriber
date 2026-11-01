@@ -232,6 +232,23 @@ def delete_dataset(api, job_id, dataset_ref):
             return False
 
 
+def download_kaggle_artifacts(api, kernel_ref, output, folder, job_id):
+    from .checkpoints import unpack_checkpoints
+    token = None
+    while True:
+        _, token = api.kernels_output(kernel_ref, str(output),
+                                      file_pattern=r"(result\.json|enhanced\.m4a|worker\.log|checkpoints\.bundle)$",
+                                      force=True, quiet=True, page_token=token)
+        if not token:
+            break
+    checkpoint = next(iter(output.rglob("checkpoints.bundle")), None)
+    if checkpoint:
+        unpack_checkpoints(checkpoint, folder)
+        log(job_id, f"Saved processing checkpoints locally ({checkpoint.stat().st_size / 1024**2:.1f} MB download). Retry can reuse completed work.")
+    for remote_log in output.rglob("worker.log"):
+        log(job_id, remote_log.read_text(encoding="utf-8", errors="replace"))
+
+
 class KaggleRunner(JobRunner):
     def run(self, job, recording):
         for name in ("KAGGLE_USERNAME", "KAGGLE_KEY", "HF_TOKEN"):
@@ -261,6 +278,17 @@ class KaggleRunner(JobRunner):
         remote_finished = False
         try:
             if not submitted:
+                checkpoint_ref = (job.payload or {}).get("checkpoint_ref")
+                if checkpoint_ref:
+                    log(job.id, "Recovering checkpoints from the previous failed notebook before starting a retry.")
+                    download_kaggle_artifacts(api, checkpoint_ref, output, folder, job.id)
+                    shutil.rmtree(output)
+                    output.mkdir()
+                    with SessionLocal() as session:
+                        live = session.get(Job, job.id)
+                        if live:
+                            live.payload = {key: value for key, value in live.payload.items() if key != "checkpoint_ref"}
+                            session.commit()
                 log(job.id, "Creating private Kaggle input dataset.")
                 source = DATA_DIR / recording.original_path
                 target = dataset / ("original" + source.suffix.lower())
@@ -271,9 +299,12 @@ class KaggleRunner(JobRunner):
                 (dataset / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
                 (dataset / "env.json").write_text(json.dumps({"HF_TOKEN": os.environ["HF_TOKEN"]}), encoding="utf-8")
                 (dataset / "dataset-metadata.json").write_text(json.dumps({"title": f"Workshop audio {job.id[:24]}", "id": dataset_ref, "licenses": [{"name": "other"}]}), encoding="utf-8")
+                from .checkpoints import pack_checkpoints
+                if pack_checkpoints(folder, dataset / "checkpoints.bundle"):
+                    log(job.id, "Including saved processing checkpoints in the private input dataset.")
                 # Kaggle can expand files with a .zip extension on ingestion.
                 with zipfile.ZipFile(dataset / "source.bundle", "w", zipfile.ZIP_DEFLATED) as archive:
-                    for name in ("models.yaml", "worker/run.py", "worker/requirements.txt", "app/__init__.py", "app/inference.py", "app/translate.py"):
+                    for name in ("models.yaml", "worker/run.py", "worker/requirements.txt", "app/__init__.py", "app/inference.py", "app/translate.py", "app/checkpoints.py"):
                         archive.write(ROOT / name, name)
                 response = api.dataset_create_new(str(dataset), public=False, quiet=True, convert_to_csv=False)
                 error = getattr(response, "error", None)
@@ -353,14 +384,28 @@ class KaggleRunner(JobRunner):
                         if not failures:
                             failures = re.findall(r"^(?:ImportError|ModuleNotFoundError|RuntimeError|OSError|ValueError):\s*(.+)$", last_log, re.MULTILINE)
                         message = failures[-1] if failures else "See the processing log for the worker error"
+                    log(job.id, "Notebook stopped; downloading any completed processing checkpoints.")
+                    try:
+                        download_kaggle_artifacts(api, kernel_ref, output, folder, job.id)
+                    except Exception as exc:
+                        log(job.id, f"Checkpoint download failed: {exc}. Retry will try to recover it before starting new compute.")
+                        with SessionLocal() as session:
+                            live = session.get(Job, job.id)
+                            if live:
+                                live.payload = {**(live.payload or {}), "checkpoint_ref": kernel_ref}
+                                session.commit()
                     raise RuntimeError(f"Kaggle notebook {state}: {message}. Open its link for the full notebook log.")
                 poll_wait(job.id)
-            log(job.id, "Downloading transcript and enhanced audio.")
-            token = None
-            while True:
-                _, token = api.kernels_output(kernel_ref, str(output), file_pattern=r"(result\.json|enhanced\.m4a|worker\.log)$", force=True, quiet=True, page_token=token)
-                if not token:
-                    break
+            log(job.id, "Downloading transcript, enhanced audio and processing checkpoints.")
+            try:
+                download_kaggle_artifacts(api, kernel_ref, output, folder, job.id)
+            except Exception:
+                with SessionLocal() as session:
+                    live = session.get(Job, job.id)
+                    if live:
+                        live.payload = {**(live.payload or {}), "checkpoint_ref": kernel_ref}
+                        session.commit()
+                raise
             results = list(output.rglob("result.json"))
             if not results:
                 raise RuntimeError("Kaggle completed without result.json; inspect the notebook log.")
@@ -372,8 +417,6 @@ class KaggleRunner(JobRunner):
             result["enhanced_path"] = "enhanced.m4a"
             result["gpu_seconds"] = max(float(result.get("gpu_seconds", 0)), remote_gpu)
             (folder / "result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-            for remote_log in output.rglob("worker.log"):
-                log(job.id, remote_log.read_text(encoding="utf-8", errors="replace"))
             return result
         except Exception as exc:
             response = getattr(exc, "response", None)
@@ -404,6 +447,8 @@ from pathlib import Path
 output = Path('/kaggle/working')
 output.mkdir(parents=True, exist_ok=True)
 log_handle = (output/'worker.log').open('w', encoding='utf-8')
+recording = None
+project = None
 
 def emit(message):
     message = str(message)
@@ -425,6 +470,7 @@ def run(arguments, env=None):
         raise subprocess.CalledProcessError(code, arguments)
 
 def main():
+    global recording, project
     source = next(Path('/kaggle/input').rglob('source.bundle'), None)
     if source is None:
         raise RuntimeError('Worker bundle is missing from mounted Kaggle inputs. Check the attached private dataset.')
@@ -437,6 +483,12 @@ def main():
     # A venv cannot isolate packages if Kaggle injects its global Python path.
     worker_env.pop('PYTHONPATH', None)
     worker_env.pop('PYTHONHOME', None)
+    # Kaggle also puts sitecustomize in the standard library, outside the venv.
+    # Override only that cloud-integration hook in our private subprocesses.
+    bootstrap = project/'bootstrap'
+    bootstrap.mkdir()
+    (bootstrap/'sitecustomize.py').write_text('"""Isolated audio worker: no Kaggle cloud integration hooks."""\n')
+    worker_env['PYTHONPATH'] = str(bootstrap)
     worker_env['PYTHONNOUSERSITE'] = '1'
     worker_env['PYTHONUNBUFFERED'] = '1'
     worker_env['HF_HOME'] = str(project/'models')
@@ -480,6 +532,11 @@ def main():
 
     recording = project/'recording'
     recording.mkdir()
+    sys.path.insert(0, str(project))
+    from app.checkpoints import unpack_checkpoints
+    if (inputs/'checkpoints.bundle').is_file():
+        emit('[resume] Restoring checkpoints from the previous run.')
+        unpack_checkpoints(inputs/'checkpoints.bundle', recording)
     settings = json.loads((inputs/'settings.json').read_text())
     settings['original_path'] = str(inputs/settings['original_path'])
     (recording/'settings.json').write_text(json.dumps(settings))
@@ -493,6 +550,14 @@ except Exception:
     emit(traceback.format_exc())
     raise
 finally:
+    if recording is not None:
+        try:
+            from app.checkpoints import pack_checkpoints
+            emit('[checkpoint] Saving completed work for future retries, including after a worker failure.')
+            if pack_checkpoints(recording, output/'checkpoints.bundle'):
+                emit('[checkpoint] Processing checkpoints saved.')
+        except Exception:
+            emit('[checkpoint] Could not save checkpoints:\n'+traceback.format_exc())
     log_handle.close()
 '''
 

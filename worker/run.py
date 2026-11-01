@@ -12,6 +12,7 @@ import time
 import traceback
 import urllib.request
 import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,6 +81,15 @@ def cached_download(url, directory, filename):
     return destination
 
 
+def valid_audio(path, seconds=None):
+    try:
+        with wave.open(str(path), "rb") as audio:
+            valid = audio.getframerate() == 16000 and audio.getnchannels() == 1 and audio.getsampwidth() == 2
+            return valid and audio.getnframes() > 0 and (seconds is None or abs(audio.getnframes() - round(seconds * 16000)) <= 1)
+    except (OSError, EOFError, wave.Error):
+        return False
+
+
 def enhance(prepared, enhanced_wav, temporary, duration, settings):
     import soundfile as sf
     from app.inference import cache_dir, config
@@ -99,32 +109,68 @@ def enhance(prepared, enhanced_wav, temporary, duration, settings):
             executable.chmod(0o755)
     model_url = enhancement["model_url"]
     model = cached_download(model_url, model_cache, model_url.rsplit("/", 1)[-1])
-    output_dir = temporary / "denoised"
-    output_dir.mkdir(exist_ok=True)
     chunk_seconds = 120
     count = max(1, int((duration + chunk_seconds - 0.001) // chunk_seconds))
-    # Bounded files avoid loading a three-hour 48 kHz recording into the native
-    # runtime. Context at each edge and delay compensation preserve alignment.
-    with sf.SoundFile(str(enhanced_wav), "w", samplerate=16000, channels=1, subtype="PCM_16") as assembled:
-        for index in range(count):
+    chunks = enhanced_wav.parent / "chunks"
+    chunks.mkdir(exist_ok=True)
+    pending = [index for index in range(count) if not valid_audio(
+        chunks / f"{index:05d}.wav", min(duration - index * chunk_seconds, chunk_seconds))]
+    if len(pending) < count:
+        log("resume", f"Reusing {count - len(pending)}/{count} completed enhancement chunks.")
+    workers = min(2, os.cpu_count() or 1, max(1, len(pending)))
+    log("enhance", f"Processing {len(pending)} remaining chunks with {workers} CPU workers.")
+
+    def process_chunk(index):
+        # Each task owns its scratch files; only a fully aligned chunk is committed.
+        with tempfile.TemporaryDirectory(prefix="enhance-", dir=str(temporary)) as scratch:
+            scratch = Path(scratch)
+            output_dir = scratch / "denoised"
+            output_dir.mkdir()
             start = index * chunk_seconds
             end = min(duration, start + chunk_seconds)
             context_start = max(0, start - 0.5)
             context_end = min(duration, end + 0.5)
-            noisy = temporary / "enhance-input.wav"
+            noisy = scratch / "enhance-input.wav"
             audio_command("-ss", str(context_start), "-t", str(context_end - context_start), "-i", prepared,
                           "-af", "apad=pad_dur=0.1", "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", noisy)
             command([executable, "--model", model, "--compensate-delay", "--output-dir", output_dir, noisy])
             denoised = output_dir / noisy.name
-            aligned = temporary / "enhance-aligned.wav"
+            aligned = scratch / "enhance-aligned.wav"
             audio_command("-ss", str(start - context_start), "-i", denoised, "-af", "apad", "-t", str(end - start),
                           "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", aligned)
-            samples, _ = sf.read(str(aligned), dtype="float32")
-            required = round((end - start) * 16000)
-            assembled.write(samples[:required])
-            log("enhance", f"Listening audio chunk {index + 1}/{count} complete.")
-    audio_command("-i", enhanced_wav, "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart",
-                  enhanced_wav.parent / "enhanced.m4a")
+            if not valid_audio(aligned, end - start):
+                raise RuntimeError(f"Enhancement chunk {index + 1} has an invalid length or format.")
+            aligned.replace(chunks / f"{index:05d}.wav")
+
+    # Native DeepFilterNet is CPU-bound. Two independent processes use available
+    # cores while bounding RAM; the model and audio quality settings are unchanged.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(process_chunk, index): index for index in pending}
+        completed = count - len(pending)
+        try:
+            for future in as_completed(futures):
+                future.result()
+                completed += 1
+                log("enhance", f"Listening audio chunk {futures[future] + 1}/{count} complete ({completed}/{count} saved).")
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+    assembled_path = enhanced_wav.with_name("enhanced.partial.wav")
+    with sf.SoundFile(str(assembled_path), "w", samplerate=16000, channels=1, subtype="PCM_16") as assembled:
+        for index in range(count):
+            samples, _ = sf.read(str(chunks / f"{index:05d}.wav"), dtype="int16")
+            assembled.write(samples)
+    assembled_path.replace(enhanced_wav)
+    encode_enhanced(enhanced_wav)
+    shutil.rmtree(chunks)
+
+
+def encode_enhanced(enhanced_wav):
+    target = enhanced_wav.parent / "enhanced.m4a"
+    temporary = target.with_name("enhanced.partial.m4a")
+    audio_command("-i", enhanced_wav, "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", temporary)
+    temporary.replace(target)
 
 
 def speech_regions(audio_paths, duration):
@@ -277,10 +323,23 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         count = check_model_access(settings)
         log("setup", f"Verified access to {count} configured model repositories.")
     original = original_file(folder, settings)
+    from app.checkpoints import cached_json, fingerprint, source_key
+    from app.inference import config
+    catalog = config()
+    log("resume", "Checking recording fingerprint and saved processing stages.")
+    input_key = source_key(original, max_seconds)
+    checkpoint = folder / "checkpoints" / input_key
+    checkpoint.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="processing-", dir=str(folder)) as work:
         temporary = Path(work)
-        prepared = temporary / "prepared.wav"
-        duration = prepare(original, prepared, max_seconds)
+        prepared = checkpoint / "prepared.wav"
+        if valid_audio(prepared):
+            duration = duration_of(prepared)
+            log("resume", f"Reusing prepared audio ({duration:.2f} seconds).")
+        else:
+            pending = checkpoint / "prepared.partial.wav"
+            duration = prepare(original, pending, max_seconds)
+            pending.replace(prepared)
         if prepare_only:
             destination = folder / "prepared-sample.wav"
             shutil.copyfile(prepared, destination)
@@ -309,15 +368,30 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
             raise ValueError("ASR input must be original, enhanced, or both.")
         if settings.get("min_speakers") and settings.get("max_speakers") and int(settings["min_speakers"]) > int(settings["max_speakers"]):
             raise ValueError("Minimum speakers cannot exceed maximum speakers.")
-        enhanced_wav = temporary / "enhanced.wav"
-        enhance(prepared, enhanced_wav, temporary, duration, settings)
-        shutil.copyfile(temporary / "enhanced.m4a", folder / "enhanced.m4a")
+        enhancement_key = fingerprint(["enhancement-v2", catalog["enhancement"]])
+        enhancement = checkpoint / ("enhance-" + enhancement_key)
+        enhancement.mkdir(exist_ok=True)
+        enhanced_wav = enhancement / "enhanced.wav"
+        if valid_audio(enhanced_wav, duration):
+            log("resume", "Reusing completed enhanced audio; no enhancement chunks need to run.")
+            if not (enhancement / "enhanced.m4a").is_file():
+                encode_enhanced(enhanced_wav)
+        else:
+            enhance(prepared, enhanced_wav, temporary, duration, settings)
+        shutil.copyfile(enhancement / "enhanced.m4a", folder / "enhanced.m4a")
         audio_paths = {"original": prepared, "enhanced": enhanced_wav}
         selected_paths = audio_paths if asr_input == "both" else {asr_input: audio_paths[asr_input]}
-        regions = speech_regions(selected_paths, duration)
+        vad_key = fingerprint(["vad-v1", asr_input, enhancement_key if asr_input != "original" else None, catalog["vad"]])
+        regions, reused = cached_json(checkpoint / f"vad-{vad_key}.json", lambda: speech_regions(selected_paths, duration))
+        if reused:
+            log("resume", f"Reusing {len(regions)} detected speech regions.")
         gpu_seconds = 0.0
         stage_start = time.monotonic()
-        turns = diarize(prepared, settings, device) if regions else []
+        diarization_key = fingerprint(["speakers-v1", catalog["diarization"], settings.get("min_speakers"), settings.get("max_speakers"), device])
+        turns, reused = (cached_json(checkpoint / f"speakers-{diarization_key}.json",
+                                    lambda: diarize(prepared, settings, device)) if regions else ([], False))
+        if reused:
+            log("resume", "Reusing completed speaker diarization.")
         if device == "cuda":
             gpu_seconds += time.monotonic() - stage_start
         segments = split_speakers(regions, turns)
@@ -332,17 +406,28 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         for model_key, language in passes:
             log("transcribe", f"Running {model_key} for {language}.")
             for version, path in selected_paths.items():
+                pass_key = fingerprint(["asr-v1", catalog["asr"][model_key], model_key, language, version,
+                                        enhancement_key if version == "enhanced" else None, segments,
+                                        settings.get("word_list", ""), device])
+                pass_folder = checkpoint / ("asr-" + pass_key)
+                reused_count = 0
                 with sf.SoundFile(str(path)) as audio:
                     for index, segment in enumerate(segments):
-                        audio.seek(round(segment["start"] * 16000))
-                        samples = audio.read(max(1, round((segment["end"] - segment["start"]) * 16000)), dtype="float32")
-                        candidate = transcribe_audio(samples, language, model_key, version, segment["start"],
-                                                     settings.get("word_list", ""), device,
-                                                     segment["end"] - segment["start"])
+                        def recognize():
+                            audio.seek(round(segment["start"] * 16000))
+                            samples = audio.read(max(1, round((segment["end"] - segment["start"]) * 16000)), dtype="float32")
+                            return transcribe_audio(samples, language, model_key, version, segment["start"],
+                                                    settings.get("word_list", ""), device,
+                                                    segment["end"] - segment["start"])
+                        candidate, reused = cached_json(pass_folder / f"{index:05d}.json", recognize)
+                        reused_count += int(reused)
                         if candidate:
                             candidates[index].append(candidate)
                         done += 1
-                        log("transcribe", f"{done}/{total} hypotheses: segment {index + 1}, {language}, {version}.")
+                        if not reused:
+                            log("transcribe", f"{done}/{total} hypotheses: segment {index + 1}, {language}, {version}.")
+                if reused_count:
+                    log("resume", f"Reused {reused_count} {model_key}/{language}/{version} hypotheses.")
         release_models()
         if device == "cuda":
             gpu_seconds += time.monotonic() - stage_start
@@ -353,7 +438,9 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
                                                        "words": [], "model": choices_for(languages[0])[0],
                                                        "audio_version": next(iter(selected_paths))}
             language = winner["language"]
-            english = translate(winner["text"], language)
+            translation_key = fingerprint(["translation-v1", winner["text"], language, catalog["translation"]])
+            english, reused = cached_json(checkpoint / "translations" / f"{translation_key}.json",
+                                         lambda: translate(winner["text"], language))
             segment.update({"start": round(segment["start"], 3), "end": round(segment["end"], 3),
                             "language": language, "suggested_language": language,
                             "machine_text": winner["text"], "text": winner["text"],
