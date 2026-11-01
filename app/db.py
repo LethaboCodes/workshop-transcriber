@@ -179,14 +179,15 @@ def serialize_job(job):
 
 
 def serialize_recording(session, recording, detail=False):
+    from .audio import available_audio_path
     data = {column.name: getattr(recording, column.name) for column in Recording.__table__.columns if column.name not in {"original_path", "enhanced_path"}}
     segments = session.scalars(select(Segment).where(Segment.recording_id == recording.id, Segment.is_deleted == False).order_by(Segment.order, Segment.start)).all()
     data["segment_count"] = len(segments)
     data["reviewed_count"] = sum(s.review_status == "reviewed" for s in segments)
     data["review_progress"] = data["reviewed_count"] / len(segments) if segments else 0
     data["has_original"] = bool(recording.original_path)
-    data["has_enhanced"] = bool(recording.enhanced_path)
-    data["audio"] = {"original": f"/api/recordings/{recording.id}/audio?version=original" if recording.original_path else None, "enhanced": f"/api/recordings/{recording.id}/audio?version=enhanced" if recording.enhanced_path else None}
+    data["has_enhanced"] = available_audio_path(recording, "enhanced") is not None
+    data["audio"] = {"original": f"/api/recordings/{recording.id}/audio?version=original" if recording.original_path else None, "enhanced": f"/api/recordings/{recording.id}/audio?version=enhanced" if data["has_enhanced"] else None}
     jobs = session.scalars(select(Job).where(Job.recording_id == recording.id).order_by(Job.created_at.desc())).all()
     data["latest_job"] = serialize_job(jobs[0]) if jobs else None
     if detail:

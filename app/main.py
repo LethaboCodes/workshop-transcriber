@@ -57,6 +57,8 @@ async def lifespan(app):
     from .bootstrap import import_inbox
     from .runners import start_dispatcher, stop_dispatcher
     import_inbox()
+    from .audio import recover_available_enhancements
+    await run_in_threadpool(recover_available_enhancements)
     start_dispatcher()
     yield
     stop_dispatcher()
@@ -175,12 +177,10 @@ def recording_settings(value):
 def safe_audio_path(recording, version):
     if version not in {"original", "enhanced"}:
         raise HTTPException(400, "Unknown audio version.")
-    stored = recording.original_path if version == "original" else recording.enhanced_path
-    if not stored:
+    from .audio import available_audio_path
+    path = available_audio_path(recording, version)
+    if path is None:
         raise HTTPException(404, f"The {version} audio is not available yet.")
-    path = (DATA_DIR / stored).resolve()
-    if not path.is_relative_to(recording_folder(recording.id)) or not path.is_file():
-        raise HTTPException(404, "Audio file not found.")
     return path
 
 

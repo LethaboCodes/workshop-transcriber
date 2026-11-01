@@ -245,6 +245,17 @@ def download_kaggle_artifacts(api, kernel_ref, output, folder, job_id):
     if checkpoint:
         unpack_checkpoints(checkpoint, folder)
         log(job_id, f"Saved processing checkpoints locally ({checkpoint.stat().st_size / 1024**2:.1f} MB download). Retry can reuse completed work.")
+        # A failed transcription must not hide an already completed enhancement.
+        from .audio import publish_checkpoint_enhancement
+        try:
+            with SessionLocal() as session:
+                live = session.get(Job, job_id)
+                recording = session.get(Recording, live.recording_id) if live else None
+                if recording and publish_checkpoint_enhancement(session, recording):
+                    session.commit()
+                    log(job_id, "Enhanced listening copy is available; transcript processing can continue separately.")
+        except Exception as exc:
+            log(job_id, f"Could not publish the enhanced preview yet: {exc}")
     manifest = next(iter(output.rglob("runtime-cache.json")), None)
     if manifest and json.loads(manifest.read_text()).get("ready"):
         with SessionLocal() as session:
