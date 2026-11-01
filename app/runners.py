@@ -389,37 +389,99 @@ class KaggleRunner(JobRunner):
                 shutil.rmtree(staging)
 
 
-KERNEL_SCRIPT = '''import json, os, shutil, subprocess, sys, tempfile, zipfile
+KERNEL_SCRIPT = r'''import ctypes.util, json, os, shutil, subprocess, sys, tempfile, traceback, zipfile
 from pathlib import Path
-source = next(Path('/kaggle/input').rglob('source.bundle'), None)
-if source is None:
-    raise RuntimeError('Worker bundle is missing from mounted Kaggle inputs. Check the attached private dataset.')
-inputs = source.parent
-project = Path(tempfile.mkdtemp(prefix='workshop-'))
-with zipfile.ZipFile(source) as z:
-    z.extractall(project)
-os.environ.update(json.loads((inputs/'env.json').read_text()))
-os.environ['HF_HOME'] = str(project/'models')
-os.environ['PYTHONUNBUFFERED'] = '1'
-subprocess.run(['apt-get', 'update', '-qq'], check=True)
-subprocess.run(['apt-get', 'install', '-y', '-qq', 'ffmpeg', 'libgomp1'], check=True)
-subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '-r', str(project/'worker/requirements.txt')], check=True)
-recording = project/'recording'
-recording.mkdir()
-settings = json.loads((inputs/'settings.json').read_text())
-settings['original_path'] = str(inputs/settings['original_path'])
-(recording/'settings.json').write_text(json.dumps(settings))
+
 output = Path('/kaggle/working')
-with (output/'worker.log').open('w') as log:
-    process = subprocess.Popen([sys.executable, '-u', str(project/'worker/run.py'), str(recording)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+output.mkdir(parents=True, exist_ok=True)
+log_handle = (output/'worker.log').open('w', encoding='utf-8')
+
+def emit(message):
+    message = str(message)
+    for name in ('HF_TOKEN', 'KAGGLE_KEY', 'APP_PASSWORD'):
+        secret = os.environ.get(name)
+        if secret:
+            message = message.replace(secret, '[secret]')
+    print(message, end='' if message.endswith('\n') else '\n', flush=True)
+    log_handle.write(message if message.endswith('\n') else message+'\n')
+    log_handle.flush()
+
+def run(arguments, env=None):
+    process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, encoding='utf-8', errors='replace', env=env)
     for line in process.stdout:
-        print(line, end='', flush=True)
-        log.write(line)
-        log.flush()
-    if process.wait():
-        raise RuntimeError('Worker failed. See worker.log above.')
-for name in ('result.json', 'enhanced.m4a'):
-    shutil.copyfile(recording/name, output/name)
+        emit(line)
+    code = process.wait()
+    if code:
+        raise subprocess.CalledProcessError(code, arguments)
+
+def main():
+    source = next(Path('/kaggle/input').rglob('source.bundle'), None)
+    if source is None:
+        raise RuntimeError('Worker bundle is missing from mounted Kaggle inputs. Check the attached private dataset.')
+    inputs = source.parent
+    project = Path(tempfile.mkdtemp(prefix='workshop-'))
+    with zipfile.ZipFile(source) as archive:
+        archive.extractall(project)
+    os.environ.update(json.loads((inputs/'env.json').read_text()))
+    worker_env = dict(os.environ)
+    # A venv cannot isolate packages if Kaggle injects its global Python path.
+    worker_env.pop('PYTHONPATH', None)
+    worker_env.pop('PYTHONHOME', None)
+    worker_env['PYTHONNOUSERSITE'] = '1'
+    worker_env['PYTHONUNBUFFERED'] = '1'
+    worker_env['HF_HOME'] = str(project/'models')
+    worker_env['MODEL_CACHE'] = str(project/'models')
+
+    missing = []
+    if not shutil.which('ffmpeg'):
+        missing.append('ffmpeg')
+    if not ctypes.util.find_library('gomp'):
+        missing.append('libgomp1')
+    if missing:
+        emit('[setup] Installing missing system tools: '+', '.join(missing))
+        run(['apt-get', 'update', '-qq'])
+        run(['apt-get', 'install', '-y', '-qq', *missing])
+    else:
+        emit('[setup] ffmpeg and OpenMP are available; no apt update is needed.')
+
+    emit('[setup] Creating an isolated Python environment for this worker.')
+    environment = project/'venv'
+    run([sys.executable, '-m', 'venv', str(environment)], env=worker_env)
+    python = str(environment/'bin/python')
+    emit('[setup] Installing worker dependencies without Kaggle global packages.')
+    run([python, '-m', 'pip', 'install', '--disable-pip-version-check', '-r',
+         str(project/'worker/requirements.txt')], env=worker_env)
+    emit('[setup] Checking dependency compatibility.')
+    run([python, '-m', 'pip', 'check'], env=worker_env)
+    emit('[setup] Checking model-library imports and GPU access before processing audio.')
+    preflight = (
+        'import torch, torchaudio, torchcodec, ctranslate2, numpy; '
+        'from pyannote.audio import Pipeline; '
+        'from silero_vad import load_silero_vad; '
+        'assert torch.cuda.is_available(), "PyTorch cannot access the Kaggle GPU"; '
+        'assert ctranslate2.get_cuda_device_count() > 0, "CTranslate2 cannot access the Kaggle GPU"; '
+        'print("[setup] Ready: torch="+torch.__version__+", torchaudio="+torchaudio.__version__+'
+        '", numpy="+numpy.__version__+", GPU="+torch.cuda.get_device_name(0))'
+    )
+    run([python, '-u', '-c', preflight], env=worker_env)
+
+    recording = project/'recording'
+    recording.mkdir()
+    settings = json.loads((inputs/'settings.json').read_text())
+    settings['original_path'] = str(inputs/settings['original_path'])
+    (recording/'settings.json').write_text(json.dumps(settings))
+    run([python, '-u', str(project/'worker/run.py'), str(recording)], env=worker_env)
+    for name in ('result.json', 'enhanced.m4a'):
+        shutil.copyfile(recording/name, output/name)
+
+try:
+    main()
+except Exception:
+    emit(traceback.format_exc())
+    raise
+finally:
+    log_handle.close()
 '''
 
 

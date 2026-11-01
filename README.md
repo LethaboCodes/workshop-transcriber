@@ -18,4 +18,4 @@ Files placed in `data/inbox/` are imported and queued on startup.
 Model repositories and language mappings are configured only in `models.yaml`.
 Local jobs need Python 3.11, ffmpeg and `worker/requirements.txt` installed on the host; run the web app on that host with `WORKER_PYTHON` pointing to that interpreter. The Docker web image intentionally has no PyTorch, so use Kaggle in Docker.
 Kaggle cancellation is local; stop the linked private notebook on Kaggle as well.
-The first model run downloads weights; missing credentials or failed jobs show a retry action.
+Kaggle workers use isolated Python environments and check dependencies/GPU access before audio processing. The first model run downloads weights; missing credentials or failed jobs show a retry action.
