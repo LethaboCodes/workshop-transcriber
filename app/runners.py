@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -12,6 +13,7 @@ import time
 import traceback
 import zipfile
 from abc import ABC, abstractmethod
+from urllib.parse import urlsplit
 
 from sqlalchemy import select
 
@@ -142,8 +144,36 @@ def status_name(response):
 
 
 def http_status(error):
-    response = getattr(error, "response", None)
-    return getattr(response, "status_code", None)
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        response = getattr(error, "response", None)
+        if response is not None:
+            return getattr(response, "status_code", None)
+        error = error.__cause__ or error.__context__
+    return None
+
+
+def kernel_reference(response, requested):
+    reference = str(getattr(response, "ref", "") or "").strip("/")
+    if not reference:
+        path = urlsplit(str(getattr(response, "url", "") or "")).path
+        parts = path.strip("/").split("/")
+        if len(parts) >= 3 and parts[0] == "code":
+            reference = "/".join(parts[1:3])
+    if reference and re.fullmatch(r"[\w-]+/[\w-]+", reference):
+        return reference
+    return requested
+
+
+def kernel_log_text(value):
+    try:
+        events = json.loads(value)
+        if isinstance(events, list):
+            return "".join(str(event.get("data", "")) for event in events if isinstance(event, dict))
+    except (ValueError, TypeError):
+        pass
+    return str(value or "")
 
 
 def wait_for_dataset(api, job_id, dataset_ref):
@@ -225,6 +255,7 @@ class KaggleRunner(JobRunner):
         created = bool((job.payload or {}).get("dataset_created"))
         remote_started = time.monotonic()
         remote_gpu = float(job.gpu_seconds or 0)
+        remote_finished = False
         try:
             if not submitted:
                 log(job.id, "Creating private Kaggle input dataset.")
@@ -237,7 +268,8 @@ class KaggleRunner(JobRunner):
                 (dataset / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
                 (dataset / "env.json").write_text(json.dumps({"HF_TOKEN": os.environ["HF_TOKEN"]}), encoding="utf-8")
                 (dataset / "dataset-metadata.json").write_text(json.dumps({"title": f"Workshop {job.id[:16]}", "id": dataset_ref, "licenses": [{"name": "other"}]}), encoding="utf-8")
-                with zipfile.ZipFile(dataset / "source.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+                # Kaggle can expand files with a .zip extension on ingestion.
+                with zipfile.ZipFile(dataset / "source.bundle", "w", zipfile.ZIP_DEFLATED) as archive:
                     for name in ("models.yaml", "worker/run.py", "worker/requirements.txt", "app/__init__.py", "app/inference.py", "app/translate.py"):
                         archive.write(ROOT / name, name)
                 response = api.dataset_create_new(str(dataset), public=False, quiet=True, convert_to_csv=False)
@@ -252,7 +284,7 @@ class KaggleRunner(JobRunner):
                         live.kaggle_ref = kernel_ref
                         session.commit()
                 wait_for_dataset(api, job.id, dataset_ref)
-                metadata = {"id": kernel_ref, "title": f"Workshop {job.id[:16]}", "code_file": "run_job.py", "language": "python", "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": True, "dataset_sources": [dataset_ref], "competition_sources": [], "kernel_sources": []}
+                metadata = {"id": kernel_ref, "title": f"Workshop {job.id[:24]}", "code_file": "run_job.py", "language": "python", "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": True, "dataset_sources": [dataset_ref], "competition_sources": [], "kernel_sources": []}
                 (kernel / "kernel-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
                 (kernel / "run_job.py").write_text(KERNEL_SCRIPT, encoding="utf-8")
                 log(job.id, "Starting private GPU notebook: https://www.kaggle.com/code/" + kernel_ref)
@@ -261,17 +293,31 @@ class KaggleRunner(JobRunner):
                 if error:
                     raise RuntimeError(f"Kaggle rejected the notebook: {error}")
                 submitted = True
+                kernel_ref = kernel_reference(response, kernel_ref)
                 with SessionLocal() as session:
                     live = session.get(Job, job.id)
                     if live:
-                        live.payload = {**(live.payload or {}), "submitted": True}
+                        live.kaggle_ref = kernel_ref
+                        live.payload = {**(live.payload or {}), "submitted": True, "resume_remote": True}
                         session.commit()
+                log(job.id, "Submitted private notebook: https://www.kaggle.com/code/" + kernel_ref)
             else:
                 log(job.id, "Resuming monitoring of existing private Kaggle notebook.")
             last_log, previous_state = "", ""
+            status_failures = 0
             while True:
                 check_cancelled(job.id)
-                response = api.kernels_status(kernel_ref)
+                try:
+                    response = api.kernels_status(kernel_ref)
+                    status_failures = 0
+                except Exception as exc:
+                    code = http_status(exc)
+                    status_failures += 1
+                    if code not in {403, 404, 429, 500, 502, 503, 504} or status_failures >= 12:
+                        raise
+                    log(job.id, f"Notebook status temporarily unavailable (HTTP {code}); retry {status_failures}/12 in 30 seconds.")
+                    poll_wait(job.id)
+                    continue
                 state = status_name(response)
                 if state != previous_state:
                     log(job.id, f"Kaggle notebook: {state}")
@@ -287,15 +333,17 @@ class KaggleRunner(JobRunner):
                 remote_started = now
                 if hasattr(api, "kernels_logs"):
                     try:
-                        current_log = str(api.kernels_logs(kernel_ref) or "")
+                        current_log = kernel_log_text(api.kernels_logs(kernel_ref))
                         if current_log and current_log != last_log:
                             log(job.id, current_log[len(last_log):] if current_log.startswith(last_log) else current_log)
                             last_log = current_log
                     except Exception:
                         pass  # Some Kaggle versions expose logs only after completion.
                 if state in ("complete", "completed"):
+                    remote_finished = True
                     break
                 if state in ("error", "failed", "cancelled", "canceled"):
+                    remote_finished = True
                     message = getattr(response, "failure_message", "")
                     raise RuntimeError(f"Kaggle notebook {state}: {message}. Open its link for the full notebook log.")
                 poll_wait(job.id)
@@ -320,16 +368,26 @@ class KaggleRunner(JobRunner):
                 log(job.id, remote_log.read_text(encoding="utf-8", errors="replace"))
             return result
         finally:
-            # On application shutdown a running notebook is resumed on startup.
-            if created and not (_stop.is_set() and submitted):
+            # Keep mounted inputs if monitoring stops before the remote run ends.
+            with SessionLocal() as session:
+                live = session.get(Job, job.id)
+                if live:
+                    live.payload = {**(live.payload or {}), "resume_remote": submitted and not remote_finished,
+                                    "remote_finished": remote_finished}
+                    session.commit()
+            if created and (not submitted or remote_finished):
                 delete_dataset(api, job.id, dataset_ref)
+            elif created:
+                log(job.id, "Private input dataset retained while the notebook may still be running. Retry resumes monitoring of the existing run.")
             if staging.exists() and staging.resolve().is_relative_to(folder.resolve()):
                 shutil.rmtree(staging)
 
 
 KERNEL_SCRIPT = '''import json, os, shutil, subprocess, sys, tempfile, zipfile
 from pathlib import Path
-source = next(Path('/kaggle/input').rglob('source.zip'))
+source = next(Path('/kaggle/input').rglob('source.bundle'), None)
+if source is None:
+    raise RuntimeError('Worker bundle is missing from mounted Kaggle inputs. Check the attached private dataset.')
 inputs = source.parent
 project = Path(tempfile.mkdtemp(prefix='workshop-'))
 with zipfile.ZipFile(source) as z:

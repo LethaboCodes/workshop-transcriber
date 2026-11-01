@@ -469,8 +469,11 @@ def retry_job(job_id: str, session: Session = Depends(db)):
         raise HTTPException(409, "Only failed or cancelled jobs can be retried.")
     if session.scalar(select(Job.id).where(Job.recording_id == old.recording_id, Job.kind == old.kind, Job.status.in_(["queued", "running", "processing"]))):
         raise HTTPException(409, "A job is already queued or running.")
-    payload = {key: value for key, value in (old.payload or {}).items() if key not in {"dataset_ref", "dataset_created", "submitted"}}
+    resume_remote = bool(old.mode == "kaggle" and old.kaggle_ref and (old.payload or {}).get("resume_remote"))
+    payload = dict(old.payload or {}) if resume_remote else {key: value for key, value in (old.payload or {}).items() if key not in {"dataset_ref", "dataset_created", "submitted", "cleanup_pending", "resume_remote", "remote_finished"}}
     job = enqueue_job(session, old.recording_id, old.kind, payload)
+    if resume_remote:
+        job.mode, job.kaggle_ref = "kaggle", old.kaggle_ref
     session.commit()
     return serialize_job(job)
 
