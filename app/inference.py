@@ -35,6 +35,36 @@ def models_catalog():
             for key, value in config()["asr"].items()]
 
 
+def check_model_access(settings):
+    """Check small gated files before spending time on audio preparation."""
+    from huggingface_hub import hf_hub_download
+    catalog = config()
+    resources = [(catalog["diarization"]["id"], "config.yaml")]
+    languages = settings.get("allowed_languages") or ["en", "xh", "af"]
+    for language in languages:
+        for key in choices_for(language):
+            model = catalog["asr"][key]
+            resources.append((model["id"], model.get("language_map_file", "config.json")))
+    if any(language != "en" for language in languages):
+        translation = catalog["translation"]
+        resources.append((translation["id"], "config.json"))
+        if translation.get("ct2_id"):
+            resources.append((translation["ct2_id"], "config.json"))
+    for model_id, filename in dict.fromkeys(resources):
+        if Path(model_id).is_dir():
+            if not (Path(model_id) / filename).is_file():
+                raise FileNotFoundError(f"Configured model {model_id} is missing {filename}.")
+            continue
+        try:
+            hf_hub_download(model_id, filename, cache_dir=str(cache_dir()), token=os.environ.get("HF_TOKEN"))
+        except Exception as exc:
+            response = getattr(exc, "response", None)
+            if getattr(response, "status_code", None) in {401, 403}:
+                raise RuntimeError(f"Model access denied for {model_id}. Open https://huggingface.co/{model_id} and accept or request access using the account that created HF_TOKEN, then retry.") from exc
+            raise RuntimeError(f"Could not read {filename} for model {model_id}: {exc}") from exc
+    return len(set(model_id for model_id, _ in resources))
+
+
 def choices_for(language, model_key=None):
     catalog = config()["asr"]
     if model_key:

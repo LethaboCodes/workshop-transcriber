@@ -452,13 +452,16 @@ def main():
 
     emit('[setup] Creating an isolated Python environment for this worker.')
     environment = project/'venv'
-    run([sys.executable, '-m', 'venv', str(environment)], env=worker_env)
+    # Kaggle's Debian Python can omit ensurepip; pip's --python option manages
+    # a pip-less venv without installing anything into the shared interpreter.
+    run([sys.executable, '-m', 'venv', '--without-pip', str(environment)], env=worker_env)
     python = str(environment/'bin/python')
+    pip = [sys.executable, '-m', 'pip', '--python', python]
     emit('[setup] Installing worker dependencies without Kaggle global packages.')
-    run([python, '-m', 'pip', 'install', '--disable-pip-version-check', '-r',
+    run([*pip, 'install', '--disable-pip-version-check', '-r',
          str(project/'worker/requirements.txt')], env=worker_env)
     emit('[setup] Checking dependency compatibility.')
-    run([python, '-m', 'pip', 'check'], env=worker_env)
+    run([*pip, 'check'], env=worker_env)
     emit('[setup] Checking model-library imports and GPU access before processing audio.')
     preflight = (
         'import torch, torchaudio, torchcodec, ctranslate2, numpy; '

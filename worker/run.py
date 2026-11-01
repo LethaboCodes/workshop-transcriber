@@ -273,6 +273,9 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         from silero_vad import load_silero_vad
         from faster_whisper import WhisperModel
         log("setup", "Model-library imports passed.")
+        from app.inference import check_model_access
+        count = check_model_access(settings)
+        log("setup", f"Verified access to {count} configured model repositories.")
     original = original_file(folder, settings)
     with tempfile.TemporaryDirectory(prefix="processing-", dir=str(folder)) as work:
         temporary = Path(work)
