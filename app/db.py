@@ -261,7 +261,7 @@ def import_result(recording_id, result, job_id=None):
         enhanced = result.get("enhanced_audio", result.get("enhanced_path", "enhanced.m4a"))
         candidate = recording_folder(recording_id) / str(enhanced)
         if candidate.resolve().is_relative_to(recording_folder(recording_id)) and candidate.is_file():
-            recording.enhanced_path = str(candidate.relative_to(DATA_DIR))
+            recording.enhanced_path = candidate.relative_to(DATA_DIR).as_posix()
         recording.status, recording.error = "ready", ""
         if job:
             job.gpu_seconds = float(result.get("gpu_seconds", result.get("total_gpu_seconds", 0)) or 0)

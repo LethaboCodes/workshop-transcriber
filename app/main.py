@@ -383,7 +383,7 @@ def assemble_upload(recording, upload):
         temporary.unlink(missing_ok=True)
         raise HTTPException(409, "The assembled recording does not match the uploaded file size.")
     temporary.replace(original)
-    return str(original.relative_to(DATA_DIR))
+    return original.relative_to(DATA_DIR).as_posix()
 
 
 @app.post("/api/recordings/{recording_id}/upload/complete")

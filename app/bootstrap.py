@@ -21,7 +21,7 @@ def import_inbox():
             destination = folder / original.name
             try:
                 shutil.move(str(original), str(destination))
-                record.original_path = str(destination.relative_to(DATA_DIR))
+                record.original_path = destination.relative_to(DATA_DIR).as_posix()
                 enqueue_job(session, record.id)
                 session.commit()
             except Exception:
