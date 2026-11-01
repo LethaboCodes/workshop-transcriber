@@ -4,7 +4,7 @@ Review English, isiXhosa and Afrikaans workshops in one local workspace.
 Requires Docker Desktop with its Linux engine running.
 Copy `.env.example` to `.env` and set the following values:
 - `APP_PASSWORD`: your single-user sign-in password (required).
-- `HF_TOKEN`: Hugging Face read token; accept the diarization model terms first.
+- `HF_TOKEN`: Hugging Face read token; accept both the diarization and Sunbird model terms using the same account.
 - `KAGGLE_USERNAME` and `KAGGLE_KEY`: credentials for private GPU jobs.
 - `JOB_MODE`: `kaggle` (default) or `local`; change it in Settings too.
 - `WEEKLY_GPU_LIMIT`: estimated weekly GPU-hour budget, default `30`.
