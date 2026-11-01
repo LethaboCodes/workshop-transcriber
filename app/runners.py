@@ -237,7 +237,7 @@ def download_kaggle_artifacts(api, kernel_ref, output, folder, job_id):
     token = None
     while True:
         _, token = api.kernels_output(kernel_ref, str(output),
-                                      file_pattern=r"(result\.json|enhanced\.m4a|worker\.log|checkpoints\.bundle)$",
+                                      file_pattern=r"(result\.json|enhanced\.m4a|worker\.log|checkpoints\.bundle|runtime-cache\.json)$",
                                       force=True, quiet=True, page_token=token)
         if not token:
             break
@@ -245,6 +245,14 @@ def download_kaggle_artifacts(api, kernel_ref, output, folder, job_id):
     if checkpoint:
         unpack_checkpoints(checkpoint, folder)
         log(job_id, f"Saved processing checkpoints locally ({checkpoint.stat().st_size / 1024**2:.1f} MB download). Retry can reuse completed work.")
+    manifest = next(iter(output.rglob("runtime-cache.json")), None)
+    if manifest and json.loads(manifest.read_text()).get("ready"):
+        with SessionLocal() as session:
+            live = session.get(Job, job_id)
+            if live:
+                live.payload = {**(live.payload or {}), "runtime_cache_available": True}
+                session.commit()
+        log(job_id, "Reusable dependencies/models are available in this private notebook's outputs; future jobs can attach them within Kaggle.")
     for remote_log in output.rglob("worker.log"):
         log(job_id, remote_log.read_text(encoding="utf-8", errors="replace"))
 
@@ -304,7 +312,7 @@ class KaggleRunner(JobRunner):
                     log(job.id, "Including saved processing checkpoints in the private input dataset.")
                 # Kaggle can expand files with a .zip extension on ingestion.
                 with zipfile.ZipFile(dataset / "source.bundle", "w", zipfile.ZIP_DEFLATED) as archive:
-                    for name in ("models.yaml", "worker/run.py", "worker/requirements.txt", "app/__init__.py", "app/inference.py", "app/translate.py", "app/checkpoints.py"):
+                    for name in ("models.yaml", "worker/run.py", "worker/runtime_cache.py", "worker/requirements.txt", "app/__init__.py", "app/inference.py", "app/translate.py", "app/checkpoints.py"):
                         archive.write(ROOT / name, name)
                 response = api.dataset_create_new(str(dataset), public=False, quiet=True, convert_to_csv=False)
                 error = getattr(response, "error", None)
@@ -318,7 +326,15 @@ class KaggleRunner(JobRunner):
                         live.kaggle_ref = kernel_ref
                         session.commit()
                 wait_for_dataset(api, job.id, dataset_ref)
-                metadata = {"id": kernel_ref, "title": f"Workshop run {job.id[:24]}", "code_file": "run_job.py", "language": "python", "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": True, "dataset_sources": [dataset_ref], "competition_sources": [], "kernel_sources": []}
+                cache_ref = ""
+                with SessionLocal() as session:
+                    for previous in session.scalars(select(Job).where(Job.mode == "kaggle", Job.status.in_(["complete", "failed"])).order_by(Job.created_at.desc()).limit(50)):
+                        if (previous.payload or {}).get("runtime_cache_available") and previous.kaggle_ref.startswith(owner + "/"):
+                            cache_ref = previous.kaggle_ref
+                            break
+                if cache_ref:
+                    log(job.id, "Attaching reusable private runtime/model cache: https://www.kaggle.com/code/" + cache_ref)
+                metadata = {"id": kernel_ref, "title": f"Workshop run {job.id[:24]}", "code_file": "run_job.py", "language": "python", "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": True, "dataset_sources": [dataset_ref], "competition_sources": [], "kernel_sources": [cache_ref] if cache_ref else []}
                 (kernel / "kernel-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
                 (kernel / "run_job.py").write_text(KERNEL_SCRIPT, encoding="utf-8")
                 log(job.id, "Starting private GPU notebook: https://www.kaggle.com/code/" + kernel_ref)
@@ -332,7 +348,8 @@ class KaggleRunner(JobRunner):
                     live = session.get(Job, job.id)
                     if live:
                         live.kaggle_ref = kernel_ref
-                        live.payload = {**(live.payload or {}), "submitted": True, "resume_remote": True}
+                        live.payload = {**(live.payload or {}), "submitted": True, "resume_remote": True,
+                                        "runtime_cache_available": False, "runtime_cache_ref": cache_ref}
                         session.commit()
                 log(job.id, "Submitted private notebook: https://www.kaggle.com/code/" + kernel_ref)
             else:
@@ -449,6 +466,7 @@ output.mkdir(parents=True, exist_ok=True)
 log_handle = (output/'worker.log').open('w', encoding='utf-8')
 recording = None
 project = None
+runtime = None
 
 def emit(message):
     message = str(message)
@@ -470,7 +488,7 @@ def run(arguments, env=None):
         raise subprocess.CalledProcessError(code, arguments)
 
 def main():
-    global recording, project
+    global recording, project, runtime
     source = next(Path('/kaggle/input').rglob('source.bundle'), None)
     if source is None:
         raise RuntimeError('Worker bundle is missing from mounted Kaggle inputs. Check the attached private dataset.')
@@ -478,6 +496,7 @@ def main():
     project = Path(tempfile.mkdtemp(prefix='workshop-'))
     with zipfile.ZipFile(source) as archive:
         archive.extractall(project)
+    sys.path.insert(0, str(project))
     os.environ.update(json.loads((inputs/'env.json').read_text()))
     worker_env = dict(os.environ)
     # A venv cannot isolate packages if Kaggle injects its global Python path.
@@ -491,8 +510,15 @@ def main():
     worker_env['PYTHONPATH'] = str(bootstrap)
     worker_env['PYTHONNOUSERSITE'] = '1'
     worker_env['PYTHONUNBUFFERED'] = '1'
-    worker_env['HF_HOME'] = str(project/'models')
-    worker_env['MODEL_CACHE'] = str(project/'models')
+    worker_env['HF_HOME'] = str(project/'hf-home')
+    worker_env['HF_XET_CACHE'] = str(project/'xet-cache')
+    worker_env['HF_XET_HIGH_PERFORMANCE'] = '1'
+    worker_env['OMP_NUM_THREADS'] = '1'
+    worker_env['UV_CONCURRENT_DOWNLOADS'] = '8'
+    worker_env['UV_CONCURRENT_INSTALLS'] = '2'
+    worker_env['UV_CONCURRENT_BUILDS'] = '1'
+    worker_env['UV_CACHE_DIR'] = str(project/'uv-cache')
+    worker_env['UV_LINK_MODE'] = 'copy'
 
     missing = []
     if not shutil.which('ffmpeg'):
@@ -513,9 +539,20 @@ def main():
     run([sys.executable, '-m', 'venv', '--without-pip', str(environment)], env=worker_env)
     python = str(environment/'bin/python')
     pip = [sys.executable, '-m', 'pip', '--python', python]
-    emit('[setup] Installing worker dependencies without Kaggle global packages.')
-    run([*pip, 'install', '--disable-pip-version-check', '-r',
-         str(project/'worker/requirements.txt')], env=worker_env)
+    from worker.runtime_cache import prepare as prepare_runtime, mark_ready
+    runtime = prepare_runtime(project, environment, output, Path('/kaggle/input'),
+                              project/'worker/requirements.txt', emit)
+    worker_env['MODEL_CACHE'] = str(runtime['models'])
+    worker_env['HF_HUB_CACHE'] = str(runtime['models'])
+    if not runtime['reused']:
+        emit('[setup] Installing uv for parallel package downloads in the isolated worker.')
+        run([*pip, 'install', '--disable-pip-version-check', 'uv>=0.9,<1'], env=worker_env)
+        emit('[setup] Installing worker dependencies with up to 8 concurrent downloads.')
+        run([python, '-m', 'uv', 'pip', 'install', '--python', python, '-r',
+             str(project/'worker/requirements.txt')], env=worker_env)
+        # The uv download cache duplicates installed wheels; retain only the
+        # installed environment and model files in notebook outputs.
+        shutil.rmtree(project/'uv-cache', ignore_errors=True)
     emit('[setup] Checking dependency compatibility.')
     run([*pip, 'check'], env=worker_env)
     emit('[setup] Checking model-library imports and GPU access before processing audio.')
@@ -526,9 +563,10 @@ def main():
         'assert torch.cuda.is_available(), "PyTorch cannot access the Kaggle GPU"; '
         'assert ctranslate2.get_cuda_device_count() > 0, "CTranslate2 cannot access the Kaggle GPU"; '
         'print("[setup] Ready: torch="+torch.__version__+", torchaudio="+torchaudio.__version__+'
-        '", numpy="+numpy.__version__+", GPU="+torch.cuda.get_device_name(0))'
+        '", numpy="+numpy.__version__+", GPUs="+str(torch.cuda.device_count())+" x "+torch.cuda.get_device_name(0))'
     )
     run([python, '-u', '-c', preflight], env=worker_env)
+    mark_ready(runtime)
 
     recording = project/'recording'
     recording.mkdir()
@@ -558,6 +596,16 @@ finally:
                 emit('[checkpoint] Processing checkpoints saved.')
         except Exception:
             emit('[checkpoint] Could not save checkpoints:\n'+traceback.format_exc())
+    if runtime is not None:
+        try:
+            from worker.runtime_cache import finish
+            finish(runtime, emit)
+        except Exception:
+            emit('[setup] Runtime cache could not be finalized:\n'+traceback.format_exc())
+            # An incomplete multi-GB cache must not crowd out the transcript
+            # and recording checkpoints in Kaggle's persisted outputs.
+            from worker.runtime_cache import remove_directory
+            remove_directory(runtime['path'], output)
     log_handle.close()
 '''
 

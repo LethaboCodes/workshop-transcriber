@@ -121,8 +121,11 @@ def _language_code(model_id, map_filename, map_key):
 
 def _load_model(model_config, device):
     from faster_whisper import WhisperModel
+    import ctranslate2
     model_id = model_config["id"]
-    key = (model_id, device)
+    gpu_count = min(2, ctranslate2.get_cuda_device_count()) if device == "cuda" else 0
+    indices = list(range(gpu_count)) or [0]
+    key = (model_id, device, tuple(indices))
     if key in _models:
         _models.move_to_end(key)
         return _models[key]
@@ -133,7 +136,8 @@ def _load_model(model_config, device):
         del old
         gc.collect()
     model = WhisperModel(model_id, device=device, compute_type="int8_float16" if device == "cuda" else "int8",
-                         download_root=str(cache_dir()), cpu_threads=max(1, min(8, os.cpu_count() or 4)))
+                         device_index=indices if gpu_count > 1 else indices[0], num_workers=max(1, gpu_count),
+                         download_root=str(cache_dir()), cpu_threads=1 if device == "cuda" else max(1, min(8, os.cpu_count() or 4)))
     _models[key] = model
     return model
 
@@ -192,24 +196,26 @@ def transcribe_audio(audio, language, model_key, audio_version="original", start
         word_list = ", ".join(str(word) for word in word_list)
     with _lock:
         model = _load_model(model_config, device)
-        options = dict(language=code, task="transcribe", beam_size=5,
-                       initial_prompt=str(word_list).strip() or None,
-                       condition_on_previous_text=False, vad_filter=False,
-                       compression_ratio_threshold=2.4, log_prob_threshold=-1.0,
-                       no_speech_threshold=0.6, temperature=(0.0, 0.2, 0.4))
-        word_timestamps = True
-        try:
-            generated, _ = model.transcribe(audio, word_timestamps=True, **options)
-            parts = list(generated)  # Alignment runs lazily, while consuming the generator.
-        except IndexError as exc:
-            if not _word_alignment_error(exc):
-                raise
-            logging.getLogger(__name__).warning(
-                "[transcribe] %s/%s/%s at %.3fs: word alignment was empty; retrying this hypothesis without word timestamps.",
-                model_key, language, audio_version, start_offset)
-            generated, _ = model.transcribe(audio, word_timestamps=False, **options)
-            parts = list(generated)
-            word_timestamps = False
+    # CTranslate2 supports concurrent calls on replicated GPU models. Keep the
+    # cache/load lock out of generation so the second GPU can actually run.
+    options = dict(language=code, task="transcribe", beam_size=5,
+                   initial_prompt=str(word_list).strip() or None,
+                   condition_on_previous_text=False, vad_filter=False,
+                   compression_ratio_threshold=2.4, log_prob_threshold=-1.0,
+                   no_speech_threshold=0.6, temperature=(0.0, 0.2, 0.4))
+    word_timestamps = True
+    try:
+        generated, _ = model.transcribe(audio, word_timestamps=True, **options)
+        parts = list(generated)  # Alignment runs lazily, while consuming the generator.
+    except IndexError as exc:
+        if not _word_alignment_error(exc):
+            raise
+        logging.getLogger(__name__).warning(
+            "[transcribe] %s/%s/%s at %.3fs: word alignment was empty; retrying this hypothesis without word timestamps.",
+            model_key, language, audio_version, start_offset)
+        generated, _ = model.transcribe(audio, word_timestamps=False, **options)
+        parts = list(generated)
+        word_timestamps = False
     valid = [part for part in parts if not _is_hallucination(part.text)
              and float(getattr(part, "compression_ratio", 0)) <= 2.4]
     text = " ".join(part.text.strip() for part in valid).strip()

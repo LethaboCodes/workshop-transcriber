@@ -403,6 +403,10 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         total = len(passes) * len(selected_paths) * len(segments)
         done = 0
         stage_start = time.monotonic()
+        workers = max(1, min(2, ctranslate2.get_cuda_device_count())) if device == "cuda" else 1
+        log("transcribe", f"Using {workers} concurrent ASR workers on {workers if device == 'cuda' else 0} GPU(s); keeping all {len(passes)} model/language passes.")
+        computed = 0
+        last_report = stage_start
         for model_key, language in passes:
             log("transcribe", f"Running {model_key} for {language}.")
             for version, path in selected_paths.items():
@@ -411,21 +415,41 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
                                         settings.get("word_list", ""), device])
                 pass_folder = checkpoint / ("asr-" + pass_key)
                 reused_count = 0
-                with sf.SoundFile(str(path)) as audio:
-                    for index, segment in enumerate(segments):
-                        def recognize():
+                def recognize_index(index):
+                    segment = segments[index]
+                    def recognize():
+                        # Each concurrent reader owns its seek position.
+                        with sf.SoundFile(str(path)) as audio:
                             audio.seek(round(segment["start"] * 16000))
                             samples = audio.read(max(1, round((segment["end"] - segment["start"]) * 16000)), dtype="float32")
-                            return transcribe_audio(samples, language, model_key, version, segment["start"],
-                                                    settings.get("word_list", ""), device,
-                                                    segment["end"] - segment["start"])
-                        candidate, reused = cached_json(pass_folder / f"{index:05d}.json", recognize)
-                        reused_count += int(reused)
-                        if candidate:
-                            candidates[index].append(candidate)
-                        done += 1
-                        if not reused:
-                            log("transcribe", f"{done}/{total} hypotheses: segment {index + 1}, {language}, {version}.")
+                        return transcribe_audio(samples, language, model_key, version, segment["start"],
+                                                settings.get("word_list", ""), device,
+                                                segment["end"] - segment["start"])
+                    candidate, reused = cached_json(pass_folder / f"{index:05d}.json", recognize)
+                    return index, candidate, reused
+                # A model pass finishes before another model can evict it. GPU
+                # replication in faster-whisper routes concurrent calls to T4s.
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [pool.submit(recognize_index, index) for index in range(len(segments))]
+                    try:
+                        for future in as_completed(futures):
+                            index, candidate, reused = future.result()
+                            reused_count += int(reused)
+                            if candidate:
+                                candidates[index].append(candidate)
+                            done += 1
+                            if not reused:
+                                computed += 1
+                                log("transcribe", f"{done}/{total} hypotheses: segment {index + 1}, {language}, {version}.")
+                            now = time.monotonic()
+                            if computed and now - last_report >= 30:
+                                rate = computed / max(0.001, now - stage_start)
+                                log("transcribe", f"Throughput: {rate * 60:.1f} hypotheses/minute; approximately {(total - done) / rate / 60:.0f} minutes of recognition remaining (excludes later downloads and translation).")
+                                last_report = now
+                    except BaseException:
+                        for future in futures:
+                            future.cancel()
+                        raise
                 if reused_count:
                     log("resume", f"Reused {reused_count} {model_key}/{language}/{version} hypotheses.")
         release_models()
