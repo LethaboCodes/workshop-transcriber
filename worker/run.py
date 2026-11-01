@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.request
 import wave
 from pathlib import Path
@@ -263,6 +264,15 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         del secrets
     if not prepare_only and not os.environ.get("HF_TOKEN"):
         raise RuntimeError("Set HF_TOKEN and accept the diarization model's Hugging Face terms before running a full job. --prepare-only validates audio without model access.")
+    if not prepare_only:
+        log("setup", "Checking speaker, VAD, ASR and codec imports before audio preparation.")
+        import torch
+        import torchaudio
+        import torchcodec
+        from pyannote.audio import Pipeline
+        from silero_vad import load_silero_vad
+        from faster_whisper import WhisperModel
+        log("setup", "Model-library imports passed.")
     original = original_file(folder, settings)
     with tempfile.TemporaryDirectory(prefix="processing-", dir=str(folder)) as work:
         temporary = Path(work)
@@ -374,11 +384,14 @@ def main():
         run(arguments.recording_folder, settings, arguments.max_seconds, arguments.prepare_only)
     except Exception as exc:
         message = str(exc)
+        details = traceback.format_exc()
         for name in ("HF_TOKEN", "KAGGLE_KEY"):
             secret = os.environ.get(name)
             if secret:
                 message = message.replace(secret, "[REDACTED]")
+                details = details.replace(secret, "[REDACTED]")
         log("failed", message)
+        print(details, flush=True)
         return 1
     return 0
 

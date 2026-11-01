@@ -344,6 +344,11 @@ class KaggleRunner(JobRunner):
                 if state in ("error", "failed", "cancelled", "canceled"):
                     remote_finished = True
                     message = getattr(response, "failure_message", "")
+                    if not message:
+                        failures = re.findall(r"^\[failed\]\s*(.+)$", last_log, re.MULTILINE)
+                        if not failures:
+                            failures = re.findall(r"^(?:ImportError|ModuleNotFoundError|RuntimeError|OSError|ValueError):\s*(.+)$", last_log, re.MULTILINE)
+                        message = failures[-1] if failures else "See the processing log for the worker error"
                     raise RuntimeError(f"Kaggle notebook {state}: {message}. Open its link for the full notebook log.")
                 poll_wait(job.id)
             log(job.id, "Downloading transcript and enhanced audio.")
