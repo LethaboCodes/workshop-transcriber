@@ -1,0 +1,39 @@
+asr:
+  english:
+    id: Systran/faster-whisper-large-v3
+    label: Whisper large-v3
+    languages: [en]
+    default_for: [en]
+    language_codes: {en: en}
+  african:
+    id: Sunbird/faster-whisper-51-african-languages
+    label: Sunbird African languages
+    languages: [xh, af]
+    default_for: [xh, af]
+    language_map_file: language_map.json
+    language_map_keys: {xh: xho, af: afr}
+  swivuriso:
+    id: digiphyte/swivuriso-turbo
+    label: Swivuriso turbo
+    languages: [xh]
+    compare_for: [xh]
+    language_codes: {xh: null}
+translation:
+  id: facebook/nllb-200-distilled-600M
+  ct2_id: JustFrederik/nllb-200-distilled-600M-ct2-int8
+  languages: {en: eng_Latn, xh: xho_Latn, af: afr_Latn}
+  target_language: eng_Latn
+diarization:
+  id: pyannote/speaker-diarization-community-1
+vad:
+  id: silero_vad
+  threshold: 0.5
+enhancement:
+  id: DeepFilterNet3
+  model_url: https://raw.githubusercontent.com/Rikorose/DeepFilterNet/v0.5.6/models/DeepFilterNet3_onnx.tar.gz
+  binaries:
+    Windows-x86_64: https://github.com/Rikorose/DeepFilterNet/releases/download/v0.5.6/deep-filter-0.5.6-x86_64-pc-windows-msvc.exe
+    Linux-x86_64: https://github.com/Rikorose/DeepFilterNet/releases/download/v0.5.6/deep-filter-0.5.6-x86_64-unknown-linux-musl
+    Linux-aarch64: https://github.com/Rikorose/DeepFilterNet/releases/download/v0.5.6/deep-filter-0.5.6-aarch64-unknown-linux-gnu
+    Darwin-arm64: https://github.com/Rikorose/DeepFilterNet/releases/download/v0.5.6/deep-filter-0.5.6-aarch64-apple-darwin
+    Darwin-x86_64: https://github.com/Rikorose/DeepFilterNet/releases/download/v0.5.6/deep-filter-0.5.6-x86_64-apple-darwin

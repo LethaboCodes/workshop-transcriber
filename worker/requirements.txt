@@ -1,0 +1,16 @@
+# DeepFilterNet uses its official native CPU binary to avoid its NumPy <2
+# requirement conflicting with pyannote 4's NumPy >=2 requirement.
+torch>=2.8,<2.9
+torchaudio>=2.8,<2.9
+torchcodec>=0.7,<0.8
+pyannote.audio>=4.0,<4.1
+silero-vad>=6,<7
+onnxruntime>=1.20,<2
+faster-whisper>=1.1,<2
+ctranslate2>=4.5,<5
+huggingface-hub>=0.28,<1
+transformers>=4.48,<5
+sentencepiece>=0.2,<1
+numpy>=2.2,<3
+soundfile>=0.13,<1
+pyyaml>=6,<7

@@ -1,0 +1,9 @@
+{
+  "name": "workshop-transcriber",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "vite --host 0.0.0.0", "build": "vite build" },
+  "dependencies": { "react": "^19.0.0", "react-dom": "^19.0.0", "wavesurfer.js": "^7.9.0" },
+  "devDependencies": { "vite": "^6.0.0" }
+}
