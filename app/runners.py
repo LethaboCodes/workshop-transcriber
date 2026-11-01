@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import zipfile
 from abc import ABC, abstractmethod
 
@@ -56,6 +57,8 @@ def log(job_id, message):
     message = safe_message(message).strip()
     if not message:
         return
+    for line in message.splitlines():
+        print(f"{utcnow()} [job {job_id}] {line}", flush=True)
     append_log(job_id, message)
     with SessionLocal() as session:
         job = session.get(Job, job_id)
@@ -143,7 +146,7 @@ class KaggleRunner(JobRunner):
         for name in ("KAGGLE_USERNAME", "KAGGLE_KEY", "HF_TOKEN"):
             if not os.getenv(name):
                 raise RuntimeError(f"Set {name} in .env and restart the app, then retry this job. HF_TOKEN also needs the diarization model terms accepted.")
-        from kaggle.api.kaggle_api_extended import KaggleApi
+        from kaggle import KaggleApi
         api = KaggleApi()
         api.authenticate()
         folder = recording_folder(recording.id)
@@ -370,6 +373,7 @@ def dispatch(cpu=False):
                 if not cpu:
                     recording.status, recording.error = "processing", ""
                 session.commit()
+            log(job_id, f"Starting {job.kind} job with {job.mode} worker.")
             if cpu:
                 run_cpu(job, recording)
             else:
@@ -386,7 +390,7 @@ def dispatch(cpu=False):
         except Exception as exc:
             if job_id:
                 message = safe_message(exc)
-                log(job_id, message)
+                log(job_id, message if isinstance(exc, Cancelled) else traceback.format_exc())
                 with SessionLocal() as session:
                     live = session.get(Job, job_id)
                     if live and live.status != "cancelled":
@@ -399,7 +403,7 @@ def dispatch(cpu=False):
                                 rec.status, rec.error = "failed", message
                         session.commit()
             else:
-                print(safe_message(exc), flush=True)
+                print(safe_message(traceback.format_exc()), flush=True)
                 _stop.wait(2)
         finally:
             if job_id:

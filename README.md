@@ -11,6 +11,7 @@ Copy `.env.example` to `.env` and set the following values:
 - `COOKIE_SECURE`: set `true` when serving behind HTTPS.
 
 Run: `docker compose up --build`
+For background mode use `docker compose up --build -d`; follow runtime/job logs with `docker compose logs -f --tail=200 web`. Save a snapshot with `docker compose logs --no-color --tail=500 web > runtime-logs.txt`.
 Open http://localhost:8000 and sign in with `APP_PASSWORD`.
 All recordings, transcripts, upload chunks and cached models stay under `data/`.
 Files placed in `data/inbox/` are imported and queued on startup.
