@@ -141,6 +141,67 @@ def status_name(response):
     return str(getattr(status, "name", status)).lower().split(".")[-1]
 
 
+def http_status(error):
+    response = getattr(error, "response", None)
+    return getattr(response, "status_code", None)
+
+
+def wait_for_dataset(api, job_id, dataset_ref):
+    # A successful create can precede access through Kaggle's status endpoint.
+    # Retry only this known-created resource, and bound permission retries.
+    permission_failures = 0
+    for attempt in range(60):
+        check_cancelled(job_id)
+        try:
+            state = status_name(api.dataset_status(dataset_ref))
+            permission_failures = 0
+        except Exception as exc:
+            code = http_status(exc)
+            if code not in {403, 404}:
+                raise
+            permission_failures += 1
+            if permission_failures >= 12:
+                raise RuntimeError(f"Kaggle created the private dataset but still returns HTTP {code} after several minutes. Open https://www.kaggle.com/datasets/{dataset_ref} with the account used by KAGGLE_USERNAME and check access.") from exc
+            log(job_id, f"Private dataset created; Kaggle access is still propagating (HTTP {code}, retry {permission_failures}/12 in 30 seconds).")
+            poll_wait(job_id)
+            continue
+        if state in {"ready", "complete", "completed"}:
+            log(job_id, "Private Kaggle dataset is ready.")
+            return
+        if state in {"error", "failed"}:
+            raise RuntimeError(f"Kaggle dataset preparation {state}.")
+        log(job_id, f"Kaggle dataset: {state or 'preparing'}")
+        poll_wait(job_id)
+    raise RuntimeError("Kaggle dataset did not become ready within 30 minutes.")
+
+
+def delete_dataset(api, job_id, dataset_ref):
+    owner, slug = dataset_ref.split("/", 1)
+    for attempt in range(6):
+        try:
+            api.dataset_delete(owner, slug, no_confirm=True)
+            with SessionLocal() as session:
+                job = session.get(Job, job_id)
+                if job:
+                    job.payload = {**(job.payload or {}), "dataset_created": False, "cleanup_pending": False}
+                    session.commit()
+            log(job_id, "Deleted private input dataset and its token file.")
+            return True
+        except Exception as exc:
+            code = http_status(exc)
+            if code in {403, 404, 429, 500, 502, 503, 504} and attempt < 5:
+                log(job_id, f"Kaggle cleanup returned HTTP {code}; retrying in 10 seconds ({attempt + 1}/6).")
+                time.sleep(10)
+                continue
+            with SessionLocal() as session:
+                job = session.get(Job, job_id)
+                if job:
+                    job.payload = {**(job.payload or {}), "cleanup_pending": True}
+                    session.commit()
+            log(job_id, f"Could not delete input dataset {dataset_ref}: {exc}. Delete it at https://www.kaggle.com/datasets/{dataset_ref}.")
+            return False
+
+
 class KaggleRunner(JobRunner):
     def run(self, job, recording):
         for name in ("KAGGLE_USERNAME", "KAGGLE_KEY", "HF_TOKEN"):
@@ -190,17 +251,7 @@ class KaggleRunner(JobRunner):
                         live.payload = {**(live.payload or {}), "dataset_ref": dataset_ref, "dataset_created": True}
                         live.kaggle_ref = kernel_ref
                         session.commit()
-                for _ in range(60):
-                    check_cancelled(job.id)
-                    state = status_name(api.dataset_status(dataset_ref))
-                    if state in ("ready", "complete", "completed"):
-                        break
-                    if state in ("error", "failed"):
-                        raise RuntimeError(f"Kaggle dataset preparation {state}.")
-                    log(job.id, f"Kaggle dataset: {state or 'preparing'}")
-                    poll_wait(job.id)
-                else:
-                    raise RuntimeError("Kaggle dataset did not become ready within 30 minutes.")
+                wait_for_dataset(api, job.id, dataset_ref)
                 metadata = {"id": kernel_ref, "title": f"Workshop {job.id[:16]}", "code_file": "run_job.py", "language": "python", "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": True, "dataset_sources": [dataset_ref], "competition_sources": [], "kernel_sources": []}
                 (kernel / "kernel-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
                 (kernel / "run_job.py").write_text(KERNEL_SCRIPT, encoding="utf-8")
@@ -271,12 +322,7 @@ class KaggleRunner(JobRunner):
         finally:
             # On application shutdown a running notebook is resumed on startup.
             if created and not (_stop.is_set() and submitted):
-                try:
-                    dataset_owner, dataset_slug = dataset_ref.split("/", 1)
-                    api.dataset_delete(dataset_owner, dataset_slug, no_confirm=True)
-                    log(job.id, "Deleted private input dataset and its token file.")
-                except Exception as exc:
-                    log(job.id, f"Could not delete input dataset {dataset_ref}: {exc}. Delete it from Kaggle Datasets.")
+                delete_dataset(api, job.id, dataset_ref)
             if staging.exists() and staging.resolve().is_relative_to(folder.resolve()):
                 shutil.rmtree(staging)
 
