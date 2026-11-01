@@ -240,6 +240,10 @@ class KaggleRunner(JobRunner):
         from kaggle import KaggleApi
         api = KaggleApi()
         api.authenticate()
+        if not (job.kaggle_ref and (job.payload or {}).get("submitted")):
+            from .inference import check_model_access
+            log(job.id, "Checking model access before uploading or starting GPU compute.")
+            check_model_access(recording.settings or {})
         folder = recording_folder(recording.id)
         staging = folder / ("kaggle-" + job.id)
         dataset = staging / "dataset"
