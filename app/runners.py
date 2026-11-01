@@ -248,9 +248,8 @@ class KaggleRunner(JobRunner):
         for path in (dataset, kernel, output):
             path.mkdir(parents=True, exist_ok=True)
         owner = os.environ["KAGGLE_USERNAME"]
-        slug = "workshop-" + job.id[:24]
-        dataset_ref = str((job.payload or {}).get("dataset_ref", f"{owner}/{slug}"))
-        kernel_ref = job.kaggle_ref or f"{owner}/{slug}"
+        dataset_ref = str((job.payload or {}).get("dataset_ref", f"{owner}/workshop-audio-{job.id[:24]}"))
+        kernel_ref = job.kaggle_ref or f"{owner}/workshop-run-{job.id[:24]}"
         submitted = bool(job.kaggle_ref and (job.payload or {}).get("submitted"))
         created = bool((job.payload or {}).get("dataset_created"))
         remote_started = time.monotonic()
@@ -267,7 +266,7 @@ class KaggleRunner(JobRunner):
                 settings["device"] = "cuda"
                 (dataset / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
                 (dataset / "env.json").write_text(json.dumps({"HF_TOKEN": os.environ["HF_TOKEN"]}), encoding="utf-8")
-                (dataset / "dataset-metadata.json").write_text(json.dumps({"title": f"Workshop {job.id[:16]}", "id": dataset_ref, "licenses": [{"name": "other"}]}), encoding="utf-8")
+                (dataset / "dataset-metadata.json").write_text(json.dumps({"title": f"Workshop audio {job.id[:24]}", "id": dataset_ref, "licenses": [{"name": "other"}]}), encoding="utf-8")
                 # Kaggle can expand files with a .zip extension on ingestion.
                 with zipfile.ZipFile(dataset / "source.bundle", "w", zipfile.ZIP_DEFLATED) as archive:
                     for name in ("models.yaml", "worker/run.py", "worker/requirements.txt", "app/__init__.py", "app/inference.py", "app/translate.py"):
@@ -284,7 +283,7 @@ class KaggleRunner(JobRunner):
                         live.kaggle_ref = kernel_ref
                         session.commit()
                 wait_for_dataset(api, job.id, dataset_ref)
-                metadata = {"id": kernel_ref, "title": f"Workshop {job.id[:24]}", "code_file": "run_job.py", "language": "python", "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": True, "dataset_sources": [dataset_ref], "competition_sources": [], "kernel_sources": []}
+                metadata = {"id": kernel_ref, "title": f"Workshop run {job.id[:24]}", "code_file": "run_job.py", "language": "python", "kernel_type": "script", "is_private": True, "enable_gpu": True, "enable_internet": True, "dataset_sources": [dataset_ref], "competition_sources": [], "kernel_sources": []}
                 (kernel / "kernel-metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
                 (kernel / "run_job.py").write_text(KERNEL_SCRIPT, encoding="utf-8")
                 log(job.id, "Starting private GPU notebook: https://www.kaggle.com/code/" + kernel_ref)
@@ -367,6 +366,13 @@ class KaggleRunner(JobRunner):
             for remote_log in output.rglob("worker.log"):
                 log(job.id, remote_log.read_text(encoding="utf-8", errors="replace"))
             return result
+        except Exception as exc:
+            response = getattr(exc, "response", None)
+            if response is not None:
+                detail = safe_message(response.text)[:2000]
+                log(job.id, f"Kaggle HTTP {response.status_code} response: {detail}")
+                raise RuntimeError(f"Kaggle HTTP {response.status_code}: {detail}") from exc
+            raise
         finally:
             # Keep mounted inputs if monitoring stops before the remote run ends.
             with SessionLocal() as session:
