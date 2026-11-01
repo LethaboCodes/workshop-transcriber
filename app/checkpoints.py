@@ -32,9 +32,12 @@ def cached_json(path, compute):
     try:
         return json.loads(path.read_text(encoding="utf-8")), True
     except (OSError, ValueError):
-        value = compute()
-        save_json(path, value)
-        return value, False
+        pass
+    # Compute outside the handler so a model error is not chained to an ordinary
+    # cache miss, which otherwise obscures its traceback with FileNotFoundError.
+    value = compute()
+    save_json(path, value)
+    return value, False
 
 
 def pack_checkpoints(recording, destination):

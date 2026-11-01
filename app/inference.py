@@ -1,6 +1,7 @@
 """Lazy, CPU/int8 segment recognition; shared by the GPU worker."""
 import gc
 import json
+import logging
 import math
 import os
 import re
@@ -157,11 +158,32 @@ def _is_hallucination(text, compression_limit=2.4):
     return False
 
 
+def _word_alignment_error(error):
+    """Limit recovery to faster-whisper's known empty word-alignment failure."""
+    if not isinstance(error, IndexError) or "boolean index did not match indexed array" not in str(error):
+        return False
+    trace = error.__traceback__
+    while trace is not None:
+        frame = trace.tb_frame
+        if (frame.f_code.co_name == "find_alignment"
+                and frame.f_globals.get("__name__", "").startswith("faster_whisper.")):
+            return True
+        trace = trace.tb_next
+    return False
+
+
 def transcribe_audio(audio, language, model_key, audio_version="original", start_offset=0,
                      word_list="", device="cpu", duration=None):
     model_config = config()["asr"][model_key]
     if language not in model_config["languages"]:
         raise ValueError("The speech model does not support this language.")
+    # Speaker boundaries can leave tiny fragments. Whisper's encoder has a
+    # 20 ms stride: shorter clips contain no complete frame to recognize/align.
+    if len(audio) < 320:
+        logging.getLogger(__name__).warning(
+            "[transcribe] %s/%s/%s at %.3fs: fragment is shorter than 20 ms; no recognition hypothesis.",
+            model_key, language, audio_version, start_offset)
+        return None
     code = model_config.get("language_codes", {}).get(language)
     if model_config.get("language_map_file"):
         code = _language_code(model_config["id"], model_config["language_map_file"],
@@ -170,12 +192,24 @@ def transcribe_audio(audio, language, model_key, audio_version="original", start
         word_list = ", ".join(str(word) for word in word_list)
     with _lock:
         model = _load_model(model_config, device)
-        generated, _ = model.transcribe(audio, language=code, task="transcribe", beam_size=5,
-                                        word_timestamps=True, initial_prompt=str(word_list).strip() or None,
-                                        condition_on_previous_text=False, vad_filter=False,
-                                        compression_ratio_threshold=2.4, log_prob_threshold=-1.0,
-                                        no_speech_threshold=0.6, temperature=(0.0, 0.2, 0.4))
-        parts = list(generated)
+        options = dict(language=code, task="transcribe", beam_size=5,
+                       initial_prompt=str(word_list).strip() or None,
+                       condition_on_previous_text=False, vad_filter=False,
+                       compression_ratio_threshold=2.4, log_prob_threshold=-1.0,
+                       no_speech_threshold=0.6, temperature=(0.0, 0.2, 0.4))
+        word_timestamps = True
+        try:
+            generated, _ = model.transcribe(audio, word_timestamps=True, **options)
+            parts = list(generated)  # Alignment runs lazily, while consuming the generator.
+        except IndexError as exc:
+            if not _word_alignment_error(exc):
+                raise
+            logging.getLogger(__name__).warning(
+                "[transcribe] %s/%s/%s at %.3fs: word alignment was empty; retrying this hypothesis without word timestamps.",
+                model_key, language, audio_version, start_offset)
+            generated, _ = model.transcribe(audio, word_timestamps=False, **options)
+            parts = list(generated)
+            word_timestamps = False
     valid = [part for part in parts if not _is_hallucination(part.text)
              and float(getattr(part, "compression_ratio", 0)) <= 2.4]
     text = " ".join(part.text.strip() for part in valid).strip()
@@ -183,7 +217,7 @@ def transcribe_audio(audio, language, model_key, audio_version="original", start
         return None
     words = []
     for part in valid:
-        for word in part.words or []:
+        for word in ((part.words or []) if word_timestamps else []):
             start = max(0.0, float(word.start))
             end = max(start, float(word.end))
             if duration is not None:
