@@ -321,6 +321,8 @@ def new_transcription(recording_id: str, session: Session = Depends(db)):
             if path.is_file() and (path.name=="prepared.wav" or path.name in {"enhanced.wav","enhanced.m4a"}
                                   or path.name.startswith(("vad-","speakers-")) and path.suffix==".json"):
                 reuse(path,folder / "checkpoints" / path.relative_to(checkpoints))
+    from .audio import publish_checkpoint_enhancement
+    publish_checkpoint_enhancement(session,recording)
     enqueue_job(session,recording.id,"pipeline",{"pipeline_version":version,"source_recording_id":source.id})
     session.commit()
     return {"id":recording.id,"pipeline_version":version}
