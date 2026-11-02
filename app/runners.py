@@ -244,7 +244,10 @@ def download_kaggle_artifacts(api, kernel_ref, output, folder, job_id):
             if not token:
                 break
     # Make small, viewable results available before large audio/checkpoint files.
-    fetch(r"(result\.json|preview\.json|worker\.log|runtime-cache\.json)$")
+    fetch(r"(result\.json|coverage\.json|preview\.json|worker\.log|runtime-cache\.json)$")
+    coverage_file = next(iter(output.rglob("coverage.json")), None)
+    if coverage_file:
+        shutil.copyfile(coverage_file, folder / "coverage.json")
     result_file = next(iter(output.rglob("result.json")), None)
     preview_file = next(iter(output.rglob("preview.json")), None)
     if result_file:
@@ -347,7 +350,7 @@ class KaggleRunner(JobRunner):
                     log(job.id, "Including saved processing checkpoints in the private input dataset.")
                 # Kaggle can expand files with a .zip extension on ingestion.
                 with zipfile.ZipFile(dataset / "source.bundle", "w", zipfile.ZIP_DEFLATED) as archive:
-                    for name in ("models.yaml", "worker/run.py", "worker/asr.py", "worker/runtime_cache.py", "worker/requirements.txt", "app/__init__.py", "app/inference.py", "app/translate.py", "app/checkpoints.py", "app/progress.py"):
+                    for name in ("models.yaml", "worker/run.py", "worker/asr.py", "worker/runtime_cache.py", "worker/requirements.txt", "app/__init__.py", "app/inference.py", "app/translate.py", "app/checkpoints.py", "app/progress.py", "app/timeline.py"):
                         archive.write(ROOT / name, name)
                 response = api.dataset_create_new(str(dataset), public=False, quiet=True, convert_to_csv=False)
                 error = getattr(response, "error", None)
@@ -619,7 +622,7 @@ def main():
     settings['original_path'] = str(inputs/settings['original_path'])
     (recording/'settings.json').write_text(json.dumps(settings))
     run([python, '-u', str(project/'worker/run.py'), str(recording)], env=worker_env)
-    for name in ('result.json', 'enhanced.m4a', 'preview.json'):
+    for name in ('result.json', 'enhanced.m4a', 'preview.json', 'coverage.json'):
         shutil.copyfile(recording/name, output/name)
 
 try:
@@ -630,8 +633,9 @@ except Exception:
 finally:
     if recording is not None:
         try:
-            if (recording/'preview.json').is_file():
-                shutil.copyfile(recording/'preview.json', output/'preview.json')
+            for name in ('preview.json','coverage.json'):
+                if (recording/name).is_file():
+                    shutil.copyfile(recording/name, output/name)
             from app.checkpoints import pack_checkpoints
             emit('[checkpoint] Saving completed work for future retries, including after a worker failure.')
             if pack_checkpoints(recording, output/'checkpoints.bundle'):

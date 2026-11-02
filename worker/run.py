@@ -366,7 +366,7 @@ def run_asr_processes(task_path, device, count, validate=False, translation=Fals
 
 def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, settings, device, temporary, publish=None):
     import ctranslate2
-    from app.checkpoints import fingerprint
+    from app.checkpoints import fingerprint, recognition_key
     from app.inference import choices_for, config
     catalog = config()
     passes = sorted([(key, language) for language in languages for key in choices_for(language)])
@@ -375,11 +375,12 @@ def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, 
     cached_count = 0
     for model_key, language in passes:
         group = groups.setdefault(model_key, {"model_key": model_key, "segments": segments, "passes": [],
-                                              "device": device, "word_list": settings.get("word_list", "")})
+                                              "device": device, "word_list": settings.get("word_list", ""),
+                                              "coverage_mode": True, "recovery": bool(settings.get("_recovery")),
+                                              "validation_index": settings.get("_validation_index",0),
+                                              "language_probe_seconds": catalog.get("pipeline", {}).get("language_probe_seconds",6)})
         for version, path in paths.items():
-            key = fingerprint(["asr-v1", catalog["asr"][model_key], model_key, language, version,
-                               enhancement_key if version == "enhanced" else None, segments,
-                               settings.get("word_list", ""), device])
+            key = recognition_key(catalog,model_key,language,version,enhancement_key,segments,settings,device)
             folder = checkpoint / ("asr-" + key)
             missing = 0
             for index in range(len(segments)):
@@ -389,7 +390,10 @@ def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, 
                 except (OSError, ValueError):
                     missing += 1
             group["passes"].append({"language": language, "version": version, "audio": str(path),
-                                    "checkpoint": str(folder), "missing": missing})
+                                    "checkpoint": str(folder), "missing": missing,
+                                    "evidence_checkpoint": str(checkpoint / ("language-" + fingerprint([
+                                        catalog["asr"][model_key],version,enhancement_key if version=="enhanced" else None,
+                                        segments,device,group["language_probe_seconds"]])))})
     count = max(1, min(2, ctranslate2.get_cuda_device_count())) if device == "cuda" else 1
     log("resume", f"{cached_count}/{total} recognition hypotheses already checkpointed.")
     log("transcribe", f"Using {count} isolated ASR processes, one fixed GPU per process; keeping all {len(passes)} model/language passes.")
@@ -401,7 +405,9 @@ def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, 
             pending.append((path, group))
         else:
             log("resume", f"Reusing every completed {group['model_key']} hypothesis; its model will not be loaded.")
+    completed_count = 0
     def collect():
+        nonlocal completed_count
         candidates = [[] for _ in segments]
         completed = 0
         for group in groups.values():
@@ -416,6 +422,7 @@ def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, 
                         pass
         if publish:
             publish(candidates, completed, total)
+        completed_count = completed
         return candidates
     candidates = collect()
     if segments:
@@ -435,7 +442,7 @@ def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, 
             return
         done += 1
         computed += 1
-        log("transcribe", f"{done}/{total} hypotheses: segment {event['index'] + 1}, {event['language']}, {event['version']}.")
+        log("transcribe", f"{done}/{total} hypotheses: window {event['index'] + 1}, {event['language']}, {event['version']}.")
         now = time.monotonic()
         if now - last_report >= 30:
             rate = computed / max(0.001, now - started)
@@ -445,6 +452,8 @@ def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, 
         log("transcribe", f"Starting fresh processes for {group['model_key']}.")
         run_asr_processes(path, device, count, progress=progress)
         candidates = collect()
+    if completed_count != total:
+        raise RuntimeError(f"Only {completed_count}/{total} window hypotheses were saved. Retry will resume the missing work.")
     return candidates
 
 
@@ -478,6 +487,8 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
     from app.inference import config
     catalog = config()
     log("resume", "Checking recording fingerprint and saved processing stages.")
+    from app.timeline import pipeline_options
+    pipeline = pipeline_options(catalog)
     input_key = source_key(original, max_seconds)
     checkpoint = folder / "checkpoints" / input_key
     checkpoint.mkdir(parents=True, exist_ok=True)
@@ -540,29 +551,61 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         stage_start = time.monotonic()
         diarization_key = fingerprint(["speakers-v1", catalog["diarization"], settings.get("min_speakers"), settings.get("max_speakers"), device])
         turns, reused = (cached_json(checkpoint / f"speakers-{diarization_key}.json",
-                                    lambda: diarize(prepared, settings, device)) if regions else ([], False))
+                                    lambda: diarize(prepared, settings, device)) if duration > 0 else ([], False))
         if reused:
             log("resume", "Reusing completed speaker diarization.")
         if device == "cuda":
             gpu_seconds += time.monotonic() - stage_start
-        segments = split_speakers(regions, turns)
-        from app.progress import draft, publish_snapshot, publish_translation
+        from app.timeline import VERSION, windows, tracks, assemble, audit, recovery_windows, speech_overlap
+        from app.progress import timeline_draft, publish_snapshot, publish_translation
+        plan = windows(duration, regions, pipeline.get("core_seconds",24), pipeline.get("context_seconds",3))
+        if audit(duration,plan,[],[],[],[])["input_coverage_gaps"]:
+            raise RuntimeError("Recognition planner left uncovered input audio.")
+        plan_key = fingerprint([VERSION,pipeline,regions,duration])
+        write_json(checkpoint / f"timeline-plan-{plan_key}.json", plan)
+        log("segment", f"Full-timeline plan: {len(plan)} overlapping windows; all {duration:.2f} seconds eligible for every model pass. Speaker turns do not cut recognition audio.")
+        preferred = {language: choices_for(language)[0] for language in languages}
         preview = None
         def preview_ready(candidates, completed, total):
             nonlocal preview
-            preview = draft(segments, candidates, languages, next(iter(selected_paths)), duration, completed, total)
-            publish_snapshot(folder, preview)
+            rows,_ = assemble(tracks(plan,candidates),turns,duration,preferred,pipeline.get("language_probe_seconds",6))
+            preview = timeline_draft(rows,duration,completed,total,turns)
+            publish_snapshot(folder,preview)
         stage_start = time.monotonic()
-        candidates = recognize_segments(segments, selected_paths, checkpoint, enhancement_key,
-                                        languages, settings, device, temporary, publish=preview_ready)
+        validation_index = max(range(len(plan)),key=lambda index:speech_overlap(plan[index]["start"],plan[index]["end"],regions))
+        candidates = recognize_segments(plan, selected_paths, checkpoint, enhancement_key,
+                                        languages, {**settings,"_validation_index":validation_index}, device, temporary, publish=preview_ready)
+        primary_lanes = tracks(plan,candidates)
+        segments,decisions = assemble(primary_lanes,turns,duration,preferred,pipeline.get("language_probe_seconds",6))
+        initial_report = audit(duration,plan,candidates,segments,regions,turns)
+        retry_plan,deferred = recovery_windows(initial_report,regions,pipeline.get("recovery_fraction",.25))
+        recovery_candidates = []
+        if retry_plan:
+            log("coverage", f"Detected {len(initial_report['issues'])} possible coverage/quality issues. Automatically checking {len(retry_plan)} shorter, shifted windows against original and enhanced audio; expensive preparation/enhancement is reused.")
+            recovery_candidates = recognize_segments(retry_plan,audio_paths,checkpoint,enhancement_key,languages,
+                {**settings,"_recovery":True},device,temporary)
+            segments,decisions = assemble(primary_lanes + tracks(retry_plan,recovery_candidates,"recovery"),
+                turns,duration,preferred,pipeline.get("language_probe_seconds",6))
+        report = audit(duration,plan,candidates,segments,regions,turns)
+        report.update(pipeline=pipeline,recognition_windows=len(plan),passes_per_audio=sum(len(choices_for(language)) for language in languages),
+                      initial_issues=initial_report["issues"],recovery_windows=len(retry_plan),deferred_recovery=deferred,
+                      selection_decisions=decisions,selection_changes=sum(x["changed"] for x in decisions),
+                      ambiguous_selections=sum(x.get("ambiguous",False) for x in decisions),
+                      recovery_limit_seconds=round(min(duration,max(60,duration*pipeline.get("recovery_fraction",.25))),3))
+        write_json(folder / "coverage.json",report)
+        write_json(checkpoint / f"coverage-{plan_key}.json",report)
+        log("coverage", f"All input audio was submitted to every primary pass. Speech evidence without words: {initial_report['speech_without_words_seconds']:.1f}s before recovery, {report['speech_without_words_seconds']:.1f}s after. {len(deferred)} intervals exceeded the recovery budget; {report['ambiguous_selections']} language cells remain ambiguous. See coverage.json.")
         if device == "cuda":
             gpu_seconds += time.monotonic() - stage_start
             torch.cuda.empty_cache()
+        for segment in segments:
+            if any(issue["start"] < segment["end"] and issue["end"] > segment["start"] for issue in report["issues"]):
+                segment["review_status"] = "flagged"
+            segment["recognition_pipeline"] = VERSION
+        preview = timeline_draft(segments,duration,len(plan),len(plan),turns)
+        publish_snapshot(folder,preview)
         for index, segment in enumerate(segments):
-            hypotheses = sorted(candidates[index], key=lambda item: item["confidence"], reverse=True)
-            winner = hypotheses[0] if hypotheses else {"text": "", "language": languages[0], "confidence": 0,
-                                                       "words": [], "model": choices_for(languages[0])[0],
-                                                       "audio_version": next(iter(selected_paths))}
+            winner = segment
             language = winner["language"]
             translation_key = fingerprint(["translation-v1", winner["text"], language, catalog["translation"]])
             english, reused = cached_json(checkpoint / "translations" / f"{translation_key}.json",
@@ -573,14 +616,21 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
                             "machine_text": winner["text"], "text": winner["text"],
                             "machine_english": english, "english": english, "english_machine_generated": True,
                             "confidence": winner["confidence"], "words": winner["words"],
-                            "alternates": hypotheses[1:], "model": winner["model"],
+                            "alternates": winner["alternates"], "model": winner["model"],
                             "audio_version": winner["audio_version"]})
             log("translate", f"Translated segment {index + 1}/{len(segments)} to English.")
         speaker_ids = list(dict.fromkeys(segment["speaker"] for segment in segments))
+        from importlib.metadata import version as package_version
+        manifest = {"pipeline":pipeline,"source_key":input_key,"models":catalog["asr"],
+                    "allowed_languages":languages,"asr_input":asr_input,"max_seconds":max_seconds,
+                    "runtime":{name:package_version(name) for name in ("faster-whisper","ctranslate2","torch","pyannote.audio","silero-vad")}}
+        manifest["code_fingerprint"] = fingerprint({name:(ROOT/name).read_text(encoding="utf-8-sig")
+            for name in ("worker/run.py","worker/asr.py","app/timeline.py","app/inference.py","app/checkpoints.py","app/translate.py","models.yaml")})
         result = {"duration": duration, "enhanced_path": "enhanced.m4a", "gpu_seconds": round(gpu_seconds, 3),
                   "speakers": [{"id": speaker, "name": "Unknown speaker" if speaker == "SPEAKER_UNKNOWN" else f"Speaker {index + 1}"}
                                for index, speaker in enumerate(speaker_ids)], "segments": segments,
-                  "device": device, "partial_sample": bool(max_seconds)}
+                  "device": device, "partial_sample": bool(max_seconds), "pipeline_version": VERSION, "coverage": report,
+                  "recognition_manifest": manifest}
         write_json(folder / "result.json", result)
         preview["stage"] = "finalizing"
         publish_snapshot(folder, preview)

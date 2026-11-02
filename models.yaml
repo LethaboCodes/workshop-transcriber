@@ -12,6 +12,9 @@ asr:
     default_for: [xh, af]
     language_map_file: language_map.json
     language_map_keys: {xh: xho, af: afr}
+    # Sunbird reuses Whisper's Icelandic token for isiXhosa; these are model tokens,
+    # not ISO language labels. Probe once per short interval, independently of forced ASR.
+    language_evidence_codes: {en: en, xh: is, af: af}
   swivuriso:
     id: digiphyte/swivuriso-turbo
     label: Swivuriso turbo
@@ -25,6 +28,13 @@ translation:
   target_language: eng_Latn
 diarization:
   id: pyannote/speaker-diarization-community-1
+pipeline:
+  version: full-coverage-v2
+  core_seconds: 24
+  context_seconds: 3
+  language_probe_seconds: 6
+  selection: evidence-consensus-v1
+  recovery_fraction: 0.25
 vad:
   id: silero_vad
   threshold: 0.5

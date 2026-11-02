@@ -174,7 +174,7 @@ def _word_alignment_error(error):
 
 
 def transcribe_audio(audio, language, model_key, audio_version="original", start_offset=0,
-                     word_list="", device="cpu", duration=None):
+                     word_list="", device="cpu", duration=None, coverage_mode=False, recovery=False):
     model_config = config()["asr"][model_key]
     if language not in model_config["languages"]:
         raise ValueError("The speech model does not support this language.")
@@ -199,6 +199,10 @@ def transcribe_audio(audio, language, model_key, audio_version="original", start
                    condition_on_previous_text=False, vad_filter=False,
                    compression_ratio_threshold=2.4, log_prob_threshold=-1.0,
                    no_speech_threshold=0.6, temperature=(0.0, 0.2, 0.4))
+    if recovery:
+        # A second, shifted context must not repeat the first no-speech veto.
+        # Repetition/timing checks still apply; this never changes the baseline decoder.
+        options["no_speech_threshold"] = None
     word_timestamps = True
     try:
         generated, _ = model.transcribe(audio, word_timestamps=True, **options)
@@ -212,11 +216,18 @@ def transcribe_audio(audio, language, model_key, audio_version="original", start
         generated, _ = model.transcribe(audio, word_timestamps=False, **options)
         parts = list(generated)
         word_timestamps = False
+    flags = []
+    if any(_is_hallucination(part.text) and part.text.strip() for part in parts):
+        flags.append("repetition")
+    if not word_timestamps:
+        flags.append("word_alignment_unavailable")
     valid = [part for part in parts if not _is_hallucination(part.text)
              and float(getattr(part, "compression_ratio", 0)) <= 2.4]
     text = " ".join(part.text.strip() for part in valid).strip()
-    if _is_hallucination(text):
+    if _is_hallucination(text) and not coverage_mode:
         return None
+    if _is_hallucination(text):
+        text, valid = "", []
     words = []
     for part in valid:
         for word in ((part.words or []) if word_timestamps else []):
@@ -229,8 +240,45 @@ def transcribe_audio(audio, language, model_key, audio_version="original", start
                           "probability": round(max(0.0, min(1.0, float(word.probability))), 4)})
     confidence = sum(word["probability"] for word in words) / len(words) if words else (
         sum(math.exp(min(0, float(part.avg_logprob))) for part in valid) / len(valid) if valid else 0)
-    return {"id": uuid.uuid4().hex, "text": text, "language": language, "model": model_key,
-            "audio_version": audio_version, "confidence": round(confidence, 4), "words": words}
+    result = {"id": uuid.uuid4().hex, "text": text, "language": language, "model": model_key,
+              "audio_version": audio_version, "confidence": round(confidence, 4), "words": words}
+    if coverage_mode:
+        pieces = []
+        for part in valid:
+            a = start_offset + max(0, float(part.start))
+            b = start_offset + min(float(duration if duration is not None else len(audio)/16000), float(part.end))
+            aligned = [w for w in words if a - .05 <= w["start"] and w["end"] <= b + .05]
+            if any(w["end"] <= w["start"] for w in aligned):
+                flags.append("suspect_timing")
+            pieces.append({"start": a, "end": max(a,b), "text": part.text.strip(), "words": aligned,
+                           "no_speech_probability": float(part.no_speech_prob), "avg_logprob": float(part.avg_logprob)})
+        result.update(pieces=pieces, quality_flags=sorted(set(flags)),
+                      rejected_parts=[{"start": start_offset + float(part.start), "end": start_offset + float(part.end),
+                                       "text": part.text.strip(), "reason": "repetition_or_compression"}
+                                      for part in parts if part not in valid])
+    return result
+
+
+def acoustic_languages(audio, model_key, start_offset=0, device="cpu", seconds=6):
+    """Independent acoustic probes, never the probability from forced-language ASR."""
+    model_config = config()["asr"][model_key]
+    mapping = model_config.get("language_evidence_codes", {})
+    if not mapping:
+        return []
+    with _lock:
+        model = _load_model(model_config, device)
+    result = []
+    stride = max(1, round(seconds * 16000))
+    for offset in range(0,len(audio),stride):
+        clip = audio[offset:offset+stride]
+        if len(clip)<320:
+            continue
+        _, _, probabilities = model.detect_language(audio=clip, vad_filter=False)
+        lookup = dict(probabilities)
+        result.append({"start":round(start_offset+offset/16000,3),
+                       "end":round(start_offset+(offset+len(clip))/16000,3),
+                       "probabilities": {language:round(float(lookup[code]),6) for language,code in mapping.items() if code in lookup}})
+    return result
 
 
 def recording_audio(folder, settings, version):

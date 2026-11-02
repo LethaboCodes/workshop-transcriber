@@ -11,6 +11,12 @@ def fingerprint(value):
                                      separators=(",", ":")).encode()).hexdigest()[:32]
 
 
+def recognition_key(catalog, model, language, version, enhancement_key, plan, settings, device):
+    return fingerprint(["window-asr-v2", catalog.get("pipeline", {}), catalog["asr"][model], model,
+                        language, version, enhancement_key if version == "enhanced" else None,
+                        plan, settings.get("word_list", ""), device, bool(settings.get("_recovery"))])
+
+
 def source_key(original, max_seconds=None):
     digest = hashlib.sha256()
     with Path(original).open("rb") as handle:

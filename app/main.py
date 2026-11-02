@@ -285,6 +285,47 @@ def recording_detail(recording_id: str, session: Session = Depends(db)):
     return serialize_recording(session, get_recording(session, recording_id), True)
 
 
+@app.get("/api/recordings/{recording_id}/coverage")
+def coverage_report(recording_id: str, session: Session = Depends(db)):
+    get_recording(session,recording_id)
+    path=recording_folder(recording_id) / "coverage.json"
+    if not path.is_file():
+        raise HTTPException(404,"This run has no coverage report.")
+    return FileResponse(path,media_type="application/json",filename="coverage.json",headers={"Cache-Control":"no-store"})
+
+
+@app.post("/api/recordings/{recording_id}/transcriptions")
+def new_transcription(recording_id: str, session: Session = Depends(db)):
+    """An independent output; only immutable compatible preparation files are reused."""
+    from .inference import config
+    source=get_recording(session,recording_id)
+    original=DATA_DIR / source.original_path
+    if not source.original_path or not original.is_file():
+        raise HTTPException(400,"The original audio is not available yet.")
+    version=config().get("pipeline",{}).get("version","baseline-v1")
+    recording=Recording(title=f"{source.title} - {version}",notes=source.notes,workshop=source.workshop,date=source.date,
+                        duration=source.duration,settings={**(source.settings or {}),"source_recording_id":source.id},
+                        filename=source.filename,size=source.size,status="queued")
+    session.add(recording);session.flush()
+    folder=recording_folder(recording.id)
+    def reuse(old,new):
+        new.parent.mkdir(parents=True,exist_ok=True)
+        try:os.link(old,new)
+        except OSError:shutil.copyfile(old,new)
+    target=folder / original.name
+    reuse(original,target)
+    recording.original_path=target.relative_to(DATA_DIR).as_posix()
+    checkpoints=recording_folder(source.id) / "checkpoints"
+    if checkpoints.is_dir():
+        for path in checkpoints.rglob("*"):
+            if path.is_file() and (path.name=="prepared.wav" or path.name in {"enhanced.wav","enhanced.m4a"}
+                                  or path.name.startswith(("vad-","speakers-")) and path.suffix==".json"):
+                reuse(path,folder / "checkpoints" / path.relative_to(checkpoints))
+    enqueue_job(session,recording.id,"pipeline",{"pipeline_version":version,"source_recording_id":source.id})
+    session.commit()
+    return {"id":recording.id,"pipeline_version":version}
+
+
 @app.patch("/api/recordings/{recording_id}")
 def patch_recording(recording_id: str, data: dict = Body(...), session: Session = Depends(db)):
     recording = get_recording(session, recording_id)

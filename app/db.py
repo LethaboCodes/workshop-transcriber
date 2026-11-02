@@ -186,6 +186,16 @@ def serialize_recording(session, recording, detail=False):
     from .audio import available_audio_path
     from .progress import read_preview
     data = {column.name: getattr(recording, column.name) for column in Recording.__table__.columns if column.name not in {"original_path", "enhanced_path"}}
+    if detail:
+        import json
+        report_path = recording_folder(recording.id) / "coverage.json"
+        if report_path.is_file():
+            try:
+                report=json.loads(report_path.read_text(encoding="utf-8"))
+                data["quality_report"]={key:report.get(key) for key in ("version","recognition_windows","speech_without_words_seconds","recovery_windows","ambiguous_selections")}
+                data["quality_report"]["unresolved_issues"]=len(report.get("issues",[]))
+            except (OSError,ValueError):
+                pass
     condition = (Segment.recording_id == recording.id, Segment.is_deleted == False)
     if detail:
         rows = session.execute(select(Segment, func.json_array_length(Segment.alternates)).where(*condition)
@@ -283,7 +293,7 @@ def import_result(recording_id, result, job_id=None):
             english = str(item.get("english", item.get("machine_english", item.get("translation", ""))))
             language = item.get("language", "en")
             model = item.get("model", "")
-            segment = Segment(recording_id=recording_id, order=index, start=float(item["start"]), end=float(item["end"]), speaker_id=speakers[key], language=language, suggested_language=item.get("suggested_language", language), machine_text=text, edited_text=text, machine_english=english, edited_english=english, confidence=float(item.get("confidence") or 0), words=item.get("words") or [], alternates=item.get("alternates") or [], model=model, audio_version=item.get("audio_version", "original"), machine_history=[{"text": text, "english": english, "model": model, "language": language, "source": "pipeline", "start": item["start"], "end": item["end"]}])
+            segment = Segment(recording_id=recording_id, order=index, start=float(item["start"]), end=float(item["end"]), speaker_id=speakers[key], language=language, suggested_language=item.get("suggested_language", language), machine_text=text, edited_text=text, machine_english=english, edited_english=english, confidence=float(item.get("confidence") or 0), words=item.get("words") or [], alternates=item.get("alternates") or [], model=model, audio_version=item.get("audio_version", "original"), review_status="flagged" if item.get("review_status")=="flagged" else "unreviewed", machine_history=[{"text": text, "english": english, "model": model, "language": language, "source": "pipeline", "start": item["start"], "end": item["end"], "selection": item.get("selection"), "pipeline_version": result.get("pipeline_version", "baseline-v1")}])
             session.add(segment)
         recording.duration = float(result.get("duration") or max((float(s["end"]) for s in result.get("segments", [])), default=0))
         enhanced = result.get("enhanced_audio", result.get("enhanced_path", "enhanced.m4a"))
