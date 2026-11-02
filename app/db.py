@@ -180,6 +180,7 @@ def serialize_job(job):
 
 def serialize_recording(session, recording, detail=False):
     from .audio import available_audio_path
+    from .progress import read_preview
     data = {column.name: getattr(recording, column.name) for column in Recording.__table__.columns if column.name not in {"original_path", "enhanced_path"}}
     segments = session.scalars(select(Segment).where(Segment.recording_id == recording.id, Segment.is_deleted == False).order_by(Segment.order, Segment.start)).all()
     data["segment_count"] = len(segments)
@@ -188,9 +189,16 @@ def serialize_recording(session, recording, detail=False):
     data["has_original"] = bool(recording.original_path)
     data["has_enhanced"] = available_audio_path(recording, "enhanced") is not None
     data["audio"] = {"original": f"/api/recordings/{recording.id}/audio?version=original" if recording.original_path else None, "enhanced": f"/api/recordings/{recording.id}/audio?version=enhanced" if data["has_enhanced"] else None}
+    preview = read_preview(recording_folder(recording.id)) if not segments and recording.status != "ready" else None
+    if preview:
+        data["preview_summary"] = {"stage": preview["stage"], "segments": len(preview.get("segments", [])),
+                                   "speakers": len(preview.get("speakers", [])), "recognition_done": preview.get("recognition_done", 0),
+                                   "recognition_total": preview.get("recognition_total", 0),
+                                   "translations_ready": sum(bool(row.get("translation_ready")) for row in preview.get("segments", []))}
     jobs = session.scalars(select(Job).where(Job.recording_id == recording.id).order_by(Job.created_at.desc())).all()
     data["latest_job"] = serialize_job(jobs[0]) if jobs else None
     if detail:
+        data["preview"] = preview
         data["segments"] = [serialize_segment(s) for s in segments]
         data["speakers"] = [{"id": s.id, "name": s.name, "recording_id": s.recording_id} for s in session.scalars(select(Speaker).where(Speaker.recording_id == recording.id))]
         data["jobs"] = [serialize_job(job) for job in jobs]

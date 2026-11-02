@@ -59,6 +59,13 @@ async def lifespan(app):
     import_inbox()
     from .audio import recover_available_enhancements
     await run_in_threadpool(recover_available_enhancements)
+    from .progress import recover_checkpoint_preview
+    with SessionLocal() as session:
+        for recording in session.scalars(select(Recording).where(Recording.status != "ready")):
+            try:
+                await run_in_threadpool(recover_checkpoint_preview, recording)
+            except (OSError, ValueError, KeyError):
+                pass  # Optional previews never block job recovery or playback.
     start_dispatcher()
     yield
     stop_dispatcher()
@@ -786,7 +793,20 @@ def export(recording_id: str, format: str = "docx", language: str = "both", spea
         raise HTTPException(400, "Unknown export format or language.")
     recording = get_recording(session, recording_id)
     speaker_rows = session.scalars(select(Speaker).where(Speaker.recording_id == recording_id).order_by(Speaker.id)).all()
-    data, media_type, filename = export_transcript(recording, active_segments(session, recording_id), speaker_rows, format, language, speakers, timestamps, anonymize)
+    segments = active_segments(session, recording_id)
+    if not segments:
+        from types import SimpleNamespace
+        from .progress import read_preview
+        preview = read_preview(recording_folder(recording_id))
+        if preview and preview.get("segments"):
+            recording = SimpleNamespace(title=recording.title + " - Provisional draft", settings=recording.settings,
+                                        workshop=recording.workshop, date=recording.date)
+            speaker_rows = [SimpleNamespace(**row) for row in preview["speakers"]]
+            segments = [SimpleNamespace(start=row["start"], end=row["end"], language=row["language"],
+                                        speaker_id=row["speaker"], edited_text=row["text"], edited_english=row["english"],
+                                        review_status="unreviewed", english_outdated=not row.get("translation_ready"),
+                                        english_machine=True) for row in preview["segments"]]
+    data, media_type, filename = export_transcript(recording, segments, speaker_rows, format, language, speakers, timestamps, anonymize)
     return Response(data, media_type=media_type, headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename)})
 
 

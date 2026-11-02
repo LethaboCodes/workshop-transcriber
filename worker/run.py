@@ -364,7 +364,7 @@ def run_asr_processes(task_path, device, count, validate=False, translation=Fals
             reader.join(timeout=1)
 
 
-def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, settings, device, temporary):
+def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, settings, device, temporary, publish=None):
     import ctranslate2
     from app.checkpoints import fingerprint
     from app.inference import choices_for, config
@@ -401,6 +401,23 @@ def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, 
             pending.append((path, group))
         else:
             log("resume", f"Reusing every completed {group['model_key']} hypothesis; its model will not be loaded.")
+    def collect():
+        candidates = [[] for _ in segments]
+        completed = 0
+        for group in groups.values():
+            for item in group["passes"]:
+                for index in range(len(segments)):
+                    try:
+                        candidate = json.loads((Path(item["checkpoint"]) / f"{index:05d}.json").read_text())
+                        completed += 1
+                        if candidate:
+                            candidates[index].append(candidate)
+                    except (OSError, ValueError):
+                        pass
+        if publish:
+            publish(candidates, completed, total)
+        return candidates
+    candidates = collect()
     if segments:
         translation_task = temporary / "translation-validation.json"
         write_json(translation_task, {"languages": languages})
@@ -427,18 +444,13 @@ def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, 
     for path, group in pending:
         log("transcribe", f"Starting fresh processes for {group['model_key']}.")
         run_asr_processes(path, device, count, progress=progress)
-    candidates = [[] for _ in segments]
-    for group in groups.values():
-        for item in group["passes"]:
-            for index in range(len(segments)):
-                candidate = json.loads((Path(item["checkpoint"]) / f"{index:05d}.json").read_text())
-                if candidate:
-                    candidates[index].append(candidate)
+        candidates = collect()
     return candidates
 
 
 def run(folder, settings, max_seconds=None, prepare_only=False):
     folder = Path(folder).resolve()
+    os.environ["RESOURCE_RUN_ID"] = settings.get("_resource_run_id", "worker")
     if not folder.is_dir():
         raise ValueError("The recording folder does not exist.")
     env_file = folder / "env.json"
@@ -534,9 +546,15 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         if device == "cuda":
             gpu_seconds += time.monotonic() - stage_start
         segments = split_speakers(regions, turns)
+        from app.progress import draft, publish_snapshot, publish_translation
+        preview = None
+        def preview_ready(candidates, completed, total):
+            nonlocal preview
+            preview = draft(segments, candidates, languages, next(iter(selected_paths)), duration, completed, total)
+            publish_snapshot(folder, preview)
         stage_start = time.monotonic()
         candidates = recognize_segments(segments, selected_paths, checkpoint, enhancement_key,
-                                        languages, settings, device, temporary)
+                                        languages, settings, device, temporary, publish=preview_ready)
         if device == "cuda":
             gpu_seconds += time.monotonic() - stage_start
             torch.cuda.empty_cache()
@@ -549,6 +567,7 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
             translation_key = fingerprint(["translation-v1", winner["text"], language, catalog["translation"]])
             english, reused = cached_json(checkpoint / "translations" / f"{translation_key}.json",
                                          lambda: translate(winner["text"], language))
+            publish_translation(folder, preview, index, english)
             segment.update({"start": round(segment["start"], 3), "end": round(segment["end"], 3),
                             "language": language, "suggested_language": language,
                             "machine_text": winner["text"], "text": winner["text"],
@@ -563,6 +582,8 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
                                for index, speaker in enumerate(speaker_ids)], "segments": segments,
                   "device": device, "partial_sample": bool(max_seconds)}
         write_json(folder / "result.json", result)
+        preview["stage"] = "finalizing"
+        publish_snapshot(folder, preview)
         log("complete", f"Saved {len(segments)} segments, enhanced audio, and {gpu_seconds:.1f} estimated GPU seconds.")
         return result
 
