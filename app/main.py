@@ -500,6 +500,11 @@ def cancel_job(job_id: str, session: Session = Depends(db)):
     return serialize_job(job)
 
 
+@app.get("/api/segments/{segment_id}")
+def segment_detail(segment_id: str, session: Session = Depends(db)):
+    return serialize_segment(get_segment(session, segment_id))
+
+
 @app.patch("/api/segments/{segment_id}")
 def patch_segment(segment_id: str, data: dict = Body(...), session: Session = Depends(db)):
     segment = get_segment(session, segment_id)

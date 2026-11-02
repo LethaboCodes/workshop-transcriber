@@ -4,8 +4,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import Boolean, Column, Float, ForeignKey, Integer, JSON, String, Text, create_engine, event, select
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import Boolean, Column, Float, ForeignKey, Integer, JSON, String, Text, case, create_engine, event, func, select
+from sqlalchemy.orm import declarative_base, defer, sessionmaker
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT / "data"))).resolve()
@@ -165,15 +165,19 @@ def append_log(job_id, message):
             session.commit()
 
 
-def serialize_segment(segment):
-    data = {column.name: getattr(segment, column.name) for column in Segment.__table__.columns if column.name != "is_deleted"}
+def serialize_segment(segment, compact=False):
+    omitted = {"is_deleted"}
+    if compact:
+        omitted.update({"alternates", "machine_history", "machine_text", "machine_english"})
+    data = {column.name: getattr(segment, column.name) for column in Segment.__table__.columns if column.name not in omitted}
+    data["alternate_count"] = getattr(segment, "_alternate_count", 0) if compact else len(segment.alternates or [])
     data["text"] = segment.edited_text
     data["english"] = segment.edited_english
     return data
 
 
-def serialize_job(job):
-    data = {column.name: getattr(job, column.name) for column in Job.__table__.columns}
+def serialize_job(job, include_log=True):
+    data = {column.name: getattr(job, column.name) for column in Job.__table__.columns if include_log or column.name != "log"}
     data["kaggle_url"] = f"https://www.kaggle.com/code/{job.kaggle_ref}" if job.kaggle_ref else None
     return data
 
@@ -182,26 +186,41 @@ def serialize_recording(session, recording, detail=False):
     from .audio import available_audio_path
     from .progress import read_preview
     data = {column.name: getattr(recording, column.name) for column in Recording.__table__.columns if column.name not in {"original_path", "enhanced_path"}}
-    segments = session.scalars(select(Segment).where(Segment.recording_id == recording.id, Segment.is_deleted == False).order_by(Segment.order, Segment.start)).all()
-    data["segment_count"] = len(segments)
-    data["reviewed_count"] = sum(s.review_status == "reviewed" for s in segments)
-    data["review_progress"] = data["reviewed_count"] / len(segments) if segments else 0
+    condition = (Segment.recording_id == recording.id, Segment.is_deleted == False)
+    if detail:
+        rows = session.execute(select(Segment, func.json_array_length(Segment.alternates)).where(*condition)
+                               .options(defer(Segment.alternates), defer(Segment.machine_history),
+                                        defer(Segment.machine_text), defer(Segment.machine_english))
+                               .order_by(Segment.order, Segment.start)).all()
+        segments = []
+        for segment, alternate_count in rows:
+            segment._alternate_count = alternate_count or 0
+            segments.append(segment)
+        data["segment_count"] = len(segments)
+        data["reviewed_count"] = sum(s.review_status == "reviewed" for s in segments)
+    else:
+        data["segment_count"], data["reviewed_count"] = session.execute(
+            select(func.count(Segment.id), func.coalesce(func.sum(case((Segment.review_status == "reviewed", 1), else_=0)), 0))
+            .where(*condition)).one()
+        segments = []
+    data["review_progress"] = data["reviewed_count"] / data["segment_count"] if data["segment_count"] else 0
     data["has_original"] = bool(recording.original_path)
     data["has_enhanced"] = available_audio_path(recording, "enhanced") is not None
     data["audio"] = {"original": f"/api/recordings/{recording.id}/audio?version=original" if recording.original_path else None, "enhanced": f"/api/recordings/{recording.id}/audio?version=enhanced" if data["has_enhanced"] else None}
-    preview = read_preview(recording_folder(recording.id)) if not segments and recording.status != "ready" else None
+    preview = read_preview(recording_folder(recording.id)) if not data["segment_count"] and recording.status != "ready" else None
     if preview:
         data["preview_summary"] = {"stage": preview["stage"], "segments": len(preview.get("segments", [])),
                                    "speakers": len(preview.get("speakers", [])), "recognition_done": preview.get("recognition_done", 0),
                                    "recognition_total": preview.get("recognition_total", 0),
                                    "translations_ready": sum(bool(row.get("translation_ready")) for row in preview.get("segments", []))}
-    jobs = session.scalars(select(Job).where(Job.recording_id == recording.id).order_by(Job.created_at.desc())).all()
-    data["latest_job"] = serialize_job(jobs[0]) if jobs else None
+    jobs_query = select(Job).where(Job.recording_id == recording.id).options(defer(Job.log)).order_by(Job.created_at.desc())
+    jobs = session.scalars(jobs_query if detail else jobs_query.limit(1)).all()
+    data["latest_job"] = serialize_job(jobs[0], include_log=False) if jobs else None
     if detail:
         data["preview"] = preview
-        data["segments"] = [serialize_segment(s) for s in segments]
+        data["segments"] = [serialize_segment(s, compact=True) for s in segments]
         data["speakers"] = [{"id": s.id, "name": s.name, "recording_id": s.recording_id} for s in session.scalars(select(Speaker).where(Speaker.recording_id == recording.id))]
-        data["jobs"] = [serialize_job(job) for job in jobs]
+        data["jobs"] = [serialize_job(job, include_log=False) for job in jobs]
     return data
 
 
