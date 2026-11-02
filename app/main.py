@@ -793,8 +793,8 @@ def search(q: str = "", session: Session = Depends(db)):
 
 
 @app.get("/api/recordings/{recording_id}/export")
-def export(recording_id: str, format: str = "docx", language: str = "both", speakers: bool = True, timestamps: bool = True, anonymize: bool = False, session: Session = Depends(db)):
-    if format not in {"docx", "srt", "vtt", "txt", "json"} or language not in {"original", "english", "both"}:
+def export(recording_id: str, format: str = "docx", language: str = "both", speakers: bool = True, timestamps: bool = True, anonymize: bool = False, layout: str = "columns", font_size: int = Query(11, ge=9, le=18), inline: bool = False, session: Session = Depends(db)):
+    if format not in {"docx", "pdf", "html", "srt", "vtt", "txt", "json"} or language not in {"original", "english", "both"} or layout not in {"columns", "stacked"}:
         raise HTTPException(400, "Unknown export format or language.")
     recording = get_recording(session, recording_id)
     speaker_rows = session.scalars(select(Speaker).where(Speaker.recording_id == recording_id).order_by(Speaker.id)).all()
@@ -811,8 +811,9 @@ def export(recording_id: str, format: str = "docx", language: str = "both", spea
                                         speaker_id=row["speaker"], edited_text=row["text"], edited_english=row["english"],
                                         review_status="unreviewed", english_outdated=not row.get("translation_ready"),
                                         english_machine=True) for row in preview["segments"]]
-    data, media_type, filename = export_transcript(recording, segments, speaker_rows, format, language, speakers, timestamps, anonymize)
-    return Response(data, media_type=media_type, headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(filename)})
+    data, media_type, filename = export_transcript(recording, segments, speaker_rows, format, language, speakers, timestamps, anonymize, layout, font_size)
+    disposition = "inline" if inline else "attachment"
+    return Response(data, media_type=media_type, headers={"Content-Disposition": disposition + "; filename*=UTF-8''" + quote(filename), "Cache-Control": "no-store"})
 
 
 @app.get("/api/accuracy")
