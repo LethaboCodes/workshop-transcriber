@@ -121,11 +121,8 @@ def _language_code(model_id, map_filename, map_key):
 
 def _load_model(model_config, device):
     from faster_whisper import WhisperModel
-    import ctranslate2
     model_id = model_config["id"]
-    gpu_count = min(2, ctranslate2.get_cuda_device_count()) if device == "cuda" else 0
-    indices = list(range(gpu_count)) or [0]
-    key = (model_id, device, tuple(indices))
+    key = (model_id, device)
     if key in _models:
         _models.move_to_end(key)
         return _models[key]
@@ -136,7 +133,7 @@ def _load_model(model_config, device):
         del old
         gc.collect()
     model = WhisperModel(model_id, device=device, compute_type="int8_float16" if device == "cuda" else "int8",
-                         device_index=indices if gpu_count > 1 else indices[0], num_workers=max(1, gpu_count),
+                         device_index=0, num_workers=1,
                          download_root=str(cache_dir()), cpu_threads=1 if device == "cuda" else max(1, min(8, os.cpu_count() or 4)))
     _models[key] = model
     return model
@@ -196,8 +193,7 @@ def transcribe_audio(audio, language, model_key, audio_version="original", start
         word_list = ", ".join(str(word) for word in word_list)
     with _lock:
         model = _load_model(model_config, device)
-    # CTranslate2 supports concurrent calls on replicated GPU models. Keep the
-    # cache/load lock out of generation so the second GPU can actually run.
+    # GPU concurrency is managed by isolated single-device worker processes.
     options = dict(language=code, task="transcribe", beam_size=5,
                    initial_prompt=str(word_list).strip() or None,
                    condition_on_previous_text=False, vad_filter=False,

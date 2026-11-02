@@ -4,10 +4,12 @@ import gc
 import json
 import os
 import platform
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.request
@@ -298,6 +300,143 @@ def write_json(path, content):
     temporary.replace(path)
 
 
+def run_asr_processes(task_path, device, count, validate=False, translation=False, progress=None):
+    """Only pipe readers use threads; each GPU model lives in its own process."""
+    messages = queue.Queue()
+    processes, readers = [], []
+    failures = {}
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+    try:
+        for shard in range(count):
+            environment = dict(os.environ)
+            physical = visible[shard].strip() if len(visible) >= count and all(visible) else str(shard)
+            environment["CUDA_VISIBLE_DEVICES"] = physical if device == "cuda" and not translation else ""
+            environment["ASR_PHYSICAL_DEVICE"] = physical
+            environment["OMP_NUM_THREADS"] = "1"
+            arguments = [sys.executable, "-u", str(ROOT / "worker/asr.py"), str(task_path),
+                         "--shard", str(shard), "--count", str(count)]
+            if validate:
+                arguments.append("--validate")
+            if translation:
+                arguments.append("--translation")
+            process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=environment)
+            processes.append(process)
+            def read_output(index, child):
+                try:
+                    for line in child.stdout:
+                        messages.put((index, line))
+                finally:
+                    messages.put((index, None))
+            reader = threading.Thread(target=read_output, args=(shard, process), daemon=True)
+            reader.start()
+            readers.append(reader)
+        ended = set()
+        while len(ended) < len(processes):
+            try:
+                index, line = messages.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if line is None:
+                ended.add(index)
+                code = processes[index].wait()
+                if code:
+                    detail = failures.get(index, "see its traceback above")
+                    raise RuntimeError(f"Isolated {'translation' if translation else 'ASR'} worker {index + 1} exited with code {code}: {detail}. Completed hypotheses remain checkpointed.")
+            elif line.startswith("[asr-progress] "):
+                if progress:
+                    progress(json.loads(line[len("[asr-progress] "):]))
+            else:
+                if line.startswith(("RuntimeError:", "ValueError:", "ImportError:", "ModuleNotFoundError:", "OSError:", "KeyError:")):
+                    failures[index] = line.strip()
+                print(line.rstrip(), flush=True)
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        for reader in readers:
+            reader.join(timeout=1)
+
+
+def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, settings, device, temporary):
+    import ctranslate2
+    from app.checkpoints import fingerprint
+    from app.inference import choices_for, config
+    catalog = config()
+    passes = sorted([(key, language) for language in languages for key in choices_for(language)])
+    groups = {}
+    total = len(passes) * len(paths) * len(segments)
+    cached_count = 0
+    for model_key, language in passes:
+        group = groups.setdefault(model_key, {"model_key": model_key, "segments": segments, "passes": [],
+                                              "device": device, "word_list": settings.get("word_list", "")})
+        for version, path in paths.items():
+            key = fingerprint(["asr-v1", catalog["asr"][model_key], model_key, language, version,
+                               enhancement_key if version == "enhanced" else None, segments,
+                               settings.get("word_list", ""), device])
+            folder = checkpoint / ("asr-" + key)
+            missing = 0
+            for index in range(len(segments)):
+                try:
+                    json.loads((folder / f"{index:05d}.json").read_text())
+                    cached_count += 1
+                except (OSError, ValueError):
+                    missing += 1
+            group["passes"].append({"language": language, "version": version, "audio": str(path),
+                                    "checkpoint": str(folder), "missing": missing})
+    count = max(1, min(2, ctranslate2.get_cuda_device_count())) if device == "cuda" else 1
+    log("resume", f"{cached_count}/{total} recognition hypotheses already checkpointed.")
+    log("transcribe", f"Using {count} isolated ASR processes, one fixed GPU per process; keeping all {len(passes)} model/language passes.")
+    pending = []
+    for index, group in enumerate(groups.values()):
+        path = temporary / f"asr-group-{index}.json"
+        write_json(path, group)
+        if any(item["missing"] for item in group["passes"]):
+            pending.append((path, group))
+        else:
+            log("resume", f"Reusing every completed {group['model_key']} hypothesis; its model will not be loaded.")
+    if segments:
+        translation_task = temporary / "translation-validation.json"
+        write_json(translation_task, {"languages": languages})
+        log("setup", "Checking real translation inference before remaining recognition work.")
+        run_asr_processes(translation_task, "cpu", 1, translation=True)
+    # Validate every remaining model on each actual GPU before any long pass.
+    for path, group in pending:
+        log("setup", f"Validating {group['model_key']} on each isolated worker with real recording audio.")
+        run_asr_processes(path, device, count, validate=True)
+    done, computed = cached_count, 0
+    started = last_report = time.monotonic()
+    def progress(event):
+        nonlocal done, computed, last_report
+        if event["reused"]:
+            return
+        done += 1
+        computed += 1
+        log("transcribe", f"{done}/{total} hypotheses: segment {event['index'] + 1}, {event['language']}, {event['version']}.")
+        now = time.monotonic()
+        if now - last_report >= 30:
+            rate = computed / max(0.001, now - started)
+            log("transcribe", f"Throughput: {rate * 60:.1f} hypotheses/minute; approximately {(total - done) / rate / 60:.0f} minutes of recognition remaining (excludes translation).")
+            last_report = now
+    for path, group in pending:
+        log("transcribe", f"Starting fresh processes for {group['model_key']}.")
+        run_asr_processes(path, device, count, progress=progress)
+    candidates = [[] for _ in segments]
+    for group in groups.values():
+        for item in group["passes"]:
+            for index in range(len(segments)):
+                candidate = json.loads((Path(item["checkpoint"]) / f"{index:05d}.json").read_text())
+                if candidate:
+                    candidates[index].append(candidate)
+    return candidates
+
+
 def run(folder, settings, max_seconds=None, prepare_only=False):
     folder = Path(folder).resolve()
     if not folder.is_dir():
@@ -351,7 +490,7 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         import ctranslate2
         import soundfile as sf
         import torch
-        from app.inference import choices_for, release_models, transcribe_audio
+        from app.inference import choices_for
         from app.translate import translate
         requested = settings.get("device", "auto")
         device = ("cuda" if torch.cuda.is_available() and ctranslate2.get_cuda_device_count() else "cpu") if requested == "auto" else requested
@@ -395,64 +534,9 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         if device == "cuda":
             gpu_seconds += time.monotonic() - stage_start
         segments = split_speakers(regions, turns)
-        candidates = [[] for _ in segments]
-        # Visit models first, keeping one large ASR model resident for its entire
-        # pass instead of reloading it for every segment.
-        passes = [(key, language) for language in languages for key in choices_for(language)]
-        passes.sort(key=lambda item: item[0])
-        total = len(passes) * len(selected_paths) * len(segments)
-        done = 0
         stage_start = time.monotonic()
-        workers = max(1, min(2, ctranslate2.get_cuda_device_count())) if device == "cuda" else 1
-        log("transcribe", f"Using {workers} concurrent ASR workers on {workers if device == 'cuda' else 0} GPU(s); keeping all {len(passes)} model/language passes.")
-        computed = 0
-        last_report = stage_start
-        for model_key, language in passes:
-            log("transcribe", f"Running {model_key} for {language}.")
-            for version, path in selected_paths.items():
-                pass_key = fingerprint(["asr-v1", catalog["asr"][model_key], model_key, language, version,
-                                        enhancement_key if version == "enhanced" else None, segments,
-                                        settings.get("word_list", ""), device])
-                pass_folder = checkpoint / ("asr-" + pass_key)
-                reused_count = 0
-                def recognize_index(index):
-                    segment = segments[index]
-                    def recognize():
-                        # Each concurrent reader owns its seek position.
-                        with sf.SoundFile(str(path)) as audio:
-                            audio.seek(round(segment["start"] * 16000))
-                            samples = audio.read(max(1, round((segment["end"] - segment["start"]) * 16000)), dtype="float32")
-                        return transcribe_audio(samples, language, model_key, version, segment["start"],
-                                                settings.get("word_list", ""), device,
-                                                segment["end"] - segment["start"])
-                    candidate, reused = cached_json(pass_folder / f"{index:05d}.json", recognize)
-                    return index, candidate, reused
-                # A model pass finishes before another model can evict it. GPU
-                # replication in faster-whisper routes concurrent calls to T4s.
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = [pool.submit(recognize_index, index) for index in range(len(segments))]
-                    try:
-                        for future in as_completed(futures):
-                            index, candidate, reused = future.result()
-                            reused_count += int(reused)
-                            if candidate:
-                                candidates[index].append(candidate)
-                            done += 1
-                            if not reused:
-                                computed += 1
-                                log("transcribe", f"{done}/{total} hypotheses: segment {index + 1}, {language}, {version}.")
-                            now = time.monotonic()
-                            if computed and now - last_report >= 30:
-                                rate = computed / max(0.001, now - stage_start)
-                                log("transcribe", f"Throughput: {rate * 60:.1f} hypotheses/minute; approximately {(total - done) / rate / 60:.0f} minutes of recognition remaining (excludes later downloads and translation).")
-                                last_report = now
-                    except BaseException:
-                        for future in futures:
-                            future.cancel()
-                        raise
-                if reused_count:
-                    log("resume", f"Reused {reused_count} {model_key}/{language}/{version} hypotheses.")
-        release_models()
+        candidates = recognize_segments(segments, selected_paths, checkpoint, enhancement_key,
+                                        languages, settings, device, temporary)
         if device == "cuda":
             gpu_seconds += time.monotonic() - stage_start
             torch.cuda.empty_cache()
