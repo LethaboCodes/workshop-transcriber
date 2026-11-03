@@ -52,6 +52,18 @@ def emit_event(event):
                                     "sha256": checksum, "data": chunk}), flush=True)
 
 
+def timeline_draft(segments, duration, completed, total, speaker_turns=()):
+    """Window recognition is assembled before publishing speaker-labelled rows."""
+    rows = [{**row,"index":index,"english":row["text"] if row["language"]=="en" else "",
+             "translation_ready":row["language"]=="en","alternates":alternate_drafts(row.get("alternates",[]))}
+            for index,row in enumerate(segments)]
+    speakers = list(dict.fromkeys([*(row["speaker"] for row in rows),*(speaker for _,_,speaker in speaker_turns)]))
+    return {"version":2,"stage":"transcription","duration":duration,"recognition_done":completed,
+            "recognition_total":total,"segments":rows,
+            "speakers":[{"id":speaker,"name":"Unknown speaker" if speaker=="SPEAKER_UNKNOWN" else f"Speaker {index+1}"}
+                        for index,speaker in enumerate(speakers)]}
+
+
 def publish_snapshot(folder, preview):
     preview = {**preview, "source": "worker", "updated_at": time.time()}
     save_json(Path(folder) / "preview.json", preview)
@@ -173,6 +185,36 @@ def recover_checkpoint_preview(recording):
     speaker_key = fingerprint(["speakers-v1", catalog["diarization"], settings.get("min_speakers"), settings.get("max_speakers"), "cuda"])
     turns_file = checkpoint / f"speakers-{speaker_key}.json"
     if not turns_file.is_file():
+        return
+    if catalog.get("pipeline", {}).get("version")=="full-coverage-v2":
+        from .timeline import windows,tracks,assemble
+        from .checkpoints import recognition_key
+        regions=json.loads(regions_file.read_text())
+        turns=json.loads(turns_file.read_text())
+        pipeline=catalog["pipeline"]
+        plan=windows(recording.duration,regions,pipeline.get("core_seconds",24),pipeline.get("context_seconds",3))
+        candidates=[[] for _ in plan]
+        languages=list(dict.fromkeys(settings.get("allowed_languages") or ["en","xh","af"]))
+        versions=["original","enhanced"] if version=="both" else [version]
+        done=total=0
+        for language in languages:
+            for model in choices_for(language):
+                for audio in versions:
+                    total+=len(plan)
+                    identity=recognition_key(catalog,model,language,audio,enhancement_key,plan,settings,"cuda")
+                    for index in range(len(plan)):
+                        try:
+                            value=json.loads((checkpoint / ("asr-"+identity) / f"{index:05d}.json").read_text())
+                            done+=1
+                            if value:candidates[index].append(value)
+                        except (OSError,ValueError):
+                            pass
+        if done:
+            rows,_=assemble(tracks(plan,candidates),turns,recording.duration,
+                            {language:choices_for(language)[0] for language in languages},pipeline.get("language_probe_seconds",6))
+            preview=timeline_draft(rows,recording.duration,done,total)
+            preview.update(source="checkpoint",updated_at=time.time())
+            save_json(folder / "preview.json",preview)
         return
     segments = split_speakers(json.loads(regions_file.read_text()), json.loads(turns_file.read_text()))
     candidates = [[] for _ in segments]

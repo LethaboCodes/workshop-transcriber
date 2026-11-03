@@ -41,7 +41,7 @@ def run_task(task, shard, count, validate=False, translation=False):
         return
     import soundfile as sf
     from app.checkpoints import cached_json
-    from app.inference import transcribe_audio, release_models
+    from app.inference import transcribe_audio, release_models, acoustic_languages, config
     device = task["device"]
     label = f"{task['model_key']} shard {shard + 1}/{count}"
     if device == "cuda":
@@ -60,8 +60,8 @@ def run_task(task, shard, count, validate=False, translation=False):
         for item in task["passes"]:
             language, version = item["language"], item["version"]
             folder = Path(item["checkpoint"])
-            indices = ([next((index for index, segment in enumerate(task["segments"])
-                              if segment["end"] - segment["start"] >= 0.5), None)] if validate
+            indices = ([task.get("validation_index",0)] if validate and task["segments"]
+                       else [] if validate
                        else range(shard, len(task["segments"]), count))
             emit(f"[transcribe] {'Validating' if validate else 'Running'} {label}, {language}, {version}.")
             with sf.SoundFile(item["audio"]) as audio:
@@ -72,8 +72,15 @@ def run_task(task, shard, count, validate=False, translation=False):
                     def recognize():
                         audio.seek(round(segment["start"] * 16000))
                         samples = audio.read(max(1, round((segment["end"] - segment["start"]) * 16000)), dtype="float32")
-                        return transcribe_audio(samples, language, task["model_key"], version, segment["start"],
-                                                task.get("word_list", ""), device, segment["end"] - segment["start"])
+                        candidate = transcribe_audio(samples, language, task["model_key"], version, segment["start"],
+                                                task.get("word_list", ""), device, segment["end"] - segment["start"],
+                                                coverage_mode=task.get("coverage_mode", False), recovery=task.get("recovery", False))
+                        if candidate is not None and task.get("coverage_mode") and config()["asr"][task["model_key"]].get("language_evidence_codes"):
+                            evidence, _ = cached_json(Path(item["evidence_checkpoint"]) / f"{index:05d}.json",
+                                lambda: acoustic_languages(samples, task["model_key"], segment["start"], device,
+                                                           task.get("language_probe_seconds",6)))
+                            candidate["language_evidence"] = evidence
+                        return candidate
                     if validate:
                         recognize()  # Always execute inference, even if this segment was checkpointed.
                         emit(f"[setup] Real {label}/{language}/{version} model loading and inference passed.")

@@ -1,10 +1,11 @@
 """SQLite storage, durable jobs, and immutable transcription draft history."""
 import os
 import uuid
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import Boolean, Column, Float, ForeignKey, Integer, JSON, String, Text, case, create_engine, event, func, select
+from sqlalchemy import Boolean, Column, Float, ForeignKey, Index, Integer, JSON, String, Text, case, create_engine, event, func, select
 from sqlalchemy.orm import declarative_base, defer, sessionmaker
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,6 +86,7 @@ class Speaker(Base):
 
 class Segment(Base):
     __tablename__ = "segment"
+    __table_args__ = (Index("segment_timeline", "recording_id", "is_deleted", "start", "order", "id"),)
     id = Column(String, primary_key=True, default=new_id)
     recording_id = Column(String, ForeignKey("recording.id", ondelete="CASCADE"), nullable=False, index=True)
     order = Column(Integer, default=0)
@@ -116,15 +118,31 @@ class AppSetting(Base):
     value = Column(JSON, nullable=False)
 
 
+class EditAction(Base):
+    __tablename__ = "edit_action"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    recording_id = Column(String, ForeignKey("recording.id", ondelete="CASCADE"), nullable=False, index=True)
+    label = Column(String, nullable=False)
+    changes = Column(JSON, nullable=False)
+    undone = Column(Boolean, default=False, nullable=False)
+    updated_at = Column(Float, default=time.time, nullable=False)
+
+
 def init_db():
     Base.metadata.create_all(engine)
+    for index in Segment.__table__.indexes:
+        index.create(engine,checkfirst=True)
     with engine.begin() as connection:
         connection.exec_driver_sql("CREATE VIRTUAL TABLE IF NOT EXISTS segment_fts USING fts5(segment_id UNINDEXED, recording_id UNINDEXED, text, english, tokenize='unicode61')")
-        connection.exec_driver_sql("CREATE TRIGGER IF NOT EXISTS segment_fts_insert AFTER INSERT ON segment WHEN new.is_deleted=0 BEGIN INSERT INTO segment_fts(segment_id,recording_id,text,english) VALUES(new.id,new.recording_id,new.edited_text,new.edited_english); END")
-        connection.exec_driver_sql("CREATE TRIGGER IF NOT EXISTS segment_fts_update AFTER UPDATE ON segment BEGIN DELETE FROM segment_fts WHERE segment_id=old.id; INSERT INTO segment_fts(segment_id,recording_id,text,english) SELECT new.id,new.recording_id,new.edited_text,new.edited_english WHERE new.is_deleted=0; END")
-        connection.exec_driver_sql("CREATE TRIGGER IF NOT EXISTS segment_fts_delete AFTER DELETE ON segment BEGIN DELETE FROM segment_fts WHERE segment_id=old.id; END")
-        connection.exec_driver_sql("DELETE FROM segment_fts")
-        connection.exec_driver_sql("INSERT INTO segment_fts(segment_id,recording_id,text,english) SELECT id,recording_id,edited_text,edited_english FROM segment WHERE is_deleted=0")
+        existing = connection.exec_driver_sql("SELECT sql FROM sqlite_master WHERE name='segment_fts_update'").scalar() or ""
+        if "old.rowid" not in existing:
+            for name in ("insert", "update", "delete"):
+                connection.exec_driver_sql(f"DROP TRIGGER IF EXISTS segment_fts_{name}")
+            connection.exec_driver_sql("CREATE TRIGGER segment_fts_insert AFTER INSERT ON segment WHEN new.is_deleted=0 BEGIN INSERT INTO segment_fts(rowid,segment_id,recording_id,text,english) VALUES(new.rowid,new.id,new.recording_id,new.edited_text,new.edited_english); END")
+            connection.exec_driver_sql("CREATE TRIGGER segment_fts_update AFTER UPDATE ON segment WHEN new.edited_text IS NOT old.edited_text OR new.edited_english IS NOT old.edited_english OR new.is_deleted IS NOT old.is_deleted BEGIN DELETE FROM segment_fts WHERE rowid=old.rowid; INSERT INTO segment_fts(rowid,segment_id,recording_id,text,english) SELECT new.rowid,new.id,new.recording_id,new.edited_text,new.edited_english WHERE new.is_deleted=0; END")
+            connection.exec_driver_sql("CREATE TRIGGER segment_fts_delete AFTER DELETE ON segment BEGIN DELETE FROM segment_fts WHERE rowid=old.rowid; END")
+            connection.exec_driver_sql("DELETE FROM segment_fts")
+            connection.exec_driver_sql("INSERT INTO segment_fts(rowid,segment_id,recording_id,text,english) SELECT rowid,id,recording_id,edited_text,edited_english FROM segment WHERE is_deleted=0")
 
 
 def recording_folder(recording_id):
@@ -141,7 +159,12 @@ def app_config(session):
     config.update({row.key: row.value for row in session.scalars(select(AppSetting))})
     since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     jobs = session.scalars(select(Job).where(Job.started_at >= since)).all()
-    config["gpu_hours"] = sum(max(0, job.gpu_seconds or 0) for job in jobs) / 3600
+    usage = {}
+    for job in jobs:
+        # Reconnecting creates a local attempt, not another Kaggle execution.
+        key = ("kaggle",job.kaggle_ref) if job.mode=="kaggle" and job.kaggle_ref else ("job",job.id)
+        usage[key] = max(usage.get(key,0), max(0,job.gpu_seconds or 0))
+    config["gpu_hours"] = sum(usage.values()) / 3600
     config["credentials"] = {"hf_token": bool(os.getenv("HF_TOKEN")), "kaggle_username": bool(os.getenv("KAGGLE_USERNAME")), "kaggle_key": bool(os.getenv("KAGGLE_KEY"))}
     return config
 
@@ -186,12 +209,25 @@ def serialize_recording(session, recording, detail=False):
     from .audio import available_audio_path
     from .progress import read_preview
     data = {column.name: getattr(recording, column.name) for column in Recording.__table__.columns if column.name not in {"original_path", "enhanced_path"}}
+    if detail:
+        from .edits import undo_state
+        data["editor_cursor"] = time.time()
+        data["undo"] = undo_state(session,recording.id)
+        import json
+        report_path = recording_folder(recording.id) / "coverage.json"
+        if report_path.is_file():
+            try:
+                report=json.loads(report_path.read_text(encoding="utf-8"))
+                data["quality_report"]={key:report.get(key) for key in ("version","recognition_windows","speech_without_words_seconds","recovery_windows","ambiguous_selections")}
+                data["quality_report"]["unresolved_issues"]=len(report.get("issues",[]))
+            except (OSError,ValueError):
+                pass
     condition = (Segment.recording_id == recording.id, Segment.is_deleted == False)
     if detail:
         rows = session.execute(select(Segment, func.json_array_length(Segment.alternates)).where(*condition)
                                .options(defer(Segment.alternates), defer(Segment.machine_history),
                                         defer(Segment.machine_text), defer(Segment.machine_english))
-                               .order_by(Segment.order, Segment.start)).all()
+                               .order_by(Segment.start, Segment.order, Segment.id)).all()
         segments = []
         for segment, alternate_count in rows:
             segment._alternate_count = alternate_count or 0
@@ -219,7 +255,7 @@ def serialize_recording(session, recording, detail=False):
     if detail:
         data["preview"] = preview
         data["segments"] = [serialize_segment(s, compact=True) for s in segments]
-        data["speakers"] = [{"id": s.id, "name": s.name, "recording_id": s.recording_id} for s in session.scalars(select(Speaker).where(Speaker.recording_id == recording.id))]
+        data["speakers"] = [{"id": s.id, "name": s.name, "recording_id": s.recording_id} for s in session.scalars(select(Speaker).where(Speaker.recording_id == recording.id).order_by(Speaker.id))]
         data["jobs"] = [serialize_job(job, include_log=False) for job in jobs]
     return data
 
@@ -283,7 +319,7 @@ def import_result(recording_id, result, job_id=None):
             english = str(item.get("english", item.get("machine_english", item.get("translation", ""))))
             language = item.get("language", "en")
             model = item.get("model", "")
-            segment = Segment(recording_id=recording_id, order=index, start=float(item["start"]), end=float(item["end"]), speaker_id=speakers[key], language=language, suggested_language=item.get("suggested_language", language), machine_text=text, edited_text=text, machine_english=english, edited_english=english, confidence=float(item.get("confidence") or 0), words=item.get("words") or [], alternates=item.get("alternates") or [], model=model, audio_version=item.get("audio_version", "original"), machine_history=[{"text": text, "english": english, "model": model, "language": language, "source": "pipeline", "start": item["start"], "end": item["end"]}])
+            segment = Segment(recording_id=recording_id, order=index, start=float(item["start"]), end=float(item["end"]), speaker_id=speakers[key], language=language, suggested_language=item.get("suggested_language", language), machine_text=text, edited_text=text, machine_english=english, edited_english=english, confidence=float(item.get("confidence") or 0), words=item.get("words") or [], alternates=item.get("alternates") or [], model=model, audio_version=item.get("audio_version", "original"), review_status="flagged" if item.get("review_status")=="flagged" else "unreviewed", machine_history=[{"text": text, "english": english, "model": model, "language": language, "source": "pipeline", "start": item["start"], "end": item["end"], "selection": item.get("selection"), "pipeline_version": result.get("pipeline_version", "baseline-v1")}])
             session.add(segment)
         recording.duration = float(result.get("duration") or max((float(s["end"]) for s in result.get("segments", [])), default=0))
         enhanced = result.get("enhanced_audio", result.get("enhanced_path", "enhanced.m4a"))
