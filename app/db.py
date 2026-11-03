@@ -1,10 +1,11 @@
 """SQLite storage, durable jobs, and immutable transcription draft history."""
 import os
 import uuid
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import Boolean, Column, Float, ForeignKey, Integer, JSON, String, Text, case, create_engine, event, func, select
+from sqlalchemy import Boolean, Column, Float, ForeignKey, Index, Integer, JSON, String, Text, case, create_engine, event, func, select
 from sqlalchemy.orm import declarative_base, defer, sessionmaker
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,6 +86,7 @@ class Speaker(Base):
 
 class Segment(Base):
     __tablename__ = "segment"
+    __table_args__ = (Index("segment_timeline", "recording_id", "is_deleted", "start", "order", "id"),)
     id = Column(String, primary_key=True, default=new_id)
     recording_id = Column(String, ForeignKey("recording.id", ondelete="CASCADE"), nullable=False, index=True)
     order = Column(Integer, default=0)
@@ -116,15 +118,31 @@ class AppSetting(Base):
     value = Column(JSON, nullable=False)
 
 
+class EditAction(Base):
+    __tablename__ = "edit_action"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    recording_id = Column(String, ForeignKey("recording.id", ondelete="CASCADE"), nullable=False, index=True)
+    label = Column(String, nullable=False)
+    changes = Column(JSON, nullable=False)
+    undone = Column(Boolean, default=False, nullable=False)
+    updated_at = Column(Float, default=time.time, nullable=False)
+
+
 def init_db():
     Base.metadata.create_all(engine)
+    for index in Segment.__table__.indexes:
+        index.create(engine,checkfirst=True)
     with engine.begin() as connection:
         connection.exec_driver_sql("CREATE VIRTUAL TABLE IF NOT EXISTS segment_fts USING fts5(segment_id UNINDEXED, recording_id UNINDEXED, text, english, tokenize='unicode61')")
-        connection.exec_driver_sql("CREATE TRIGGER IF NOT EXISTS segment_fts_insert AFTER INSERT ON segment WHEN new.is_deleted=0 BEGIN INSERT INTO segment_fts(segment_id,recording_id,text,english) VALUES(new.id,new.recording_id,new.edited_text,new.edited_english); END")
-        connection.exec_driver_sql("CREATE TRIGGER IF NOT EXISTS segment_fts_update AFTER UPDATE ON segment BEGIN DELETE FROM segment_fts WHERE segment_id=old.id; INSERT INTO segment_fts(segment_id,recording_id,text,english) SELECT new.id,new.recording_id,new.edited_text,new.edited_english WHERE new.is_deleted=0; END")
-        connection.exec_driver_sql("CREATE TRIGGER IF NOT EXISTS segment_fts_delete AFTER DELETE ON segment BEGIN DELETE FROM segment_fts WHERE segment_id=old.id; END")
-        connection.exec_driver_sql("DELETE FROM segment_fts")
-        connection.exec_driver_sql("INSERT INTO segment_fts(segment_id,recording_id,text,english) SELECT id,recording_id,edited_text,edited_english FROM segment WHERE is_deleted=0")
+        existing = connection.exec_driver_sql("SELECT sql FROM sqlite_master WHERE name='segment_fts_update'").scalar() or ""
+        if "old.rowid" not in existing:
+            for name in ("insert", "update", "delete"):
+                connection.exec_driver_sql(f"DROP TRIGGER IF EXISTS segment_fts_{name}")
+            connection.exec_driver_sql("CREATE TRIGGER segment_fts_insert AFTER INSERT ON segment WHEN new.is_deleted=0 BEGIN INSERT INTO segment_fts(rowid,segment_id,recording_id,text,english) VALUES(new.rowid,new.id,new.recording_id,new.edited_text,new.edited_english); END")
+            connection.exec_driver_sql("CREATE TRIGGER segment_fts_update AFTER UPDATE ON segment WHEN new.edited_text IS NOT old.edited_text OR new.edited_english IS NOT old.edited_english OR new.is_deleted IS NOT old.is_deleted BEGIN DELETE FROM segment_fts WHERE rowid=old.rowid; INSERT INTO segment_fts(rowid,segment_id,recording_id,text,english) SELECT new.rowid,new.id,new.recording_id,new.edited_text,new.edited_english WHERE new.is_deleted=0; END")
+            connection.exec_driver_sql("CREATE TRIGGER segment_fts_delete AFTER DELETE ON segment BEGIN DELETE FROM segment_fts WHERE rowid=old.rowid; END")
+            connection.exec_driver_sql("DELETE FROM segment_fts")
+            connection.exec_driver_sql("INSERT INTO segment_fts(rowid,segment_id,recording_id,text,english) SELECT rowid,id,recording_id,edited_text,edited_english FROM segment WHERE is_deleted=0")
 
 
 def recording_folder(recording_id):
@@ -192,6 +210,9 @@ def serialize_recording(session, recording, detail=False):
     from .progress import read_preview
     data = {column.name: getattr(recording, column.name) for column in Recording.__table__.columns if column.name not in {"original_path", "enhanced_path"}}
     if detail:
+        from .edits import undo_state
+        data["editor_cursor"] = time.time()
+        data["undo"] = undo_state(session,recording.id)
         import json
         report_path = recording_folder(recording.id) / "coverage.json"
         if report_path.is_file():
@@ -206,7 +227,7 @@ def serialize_recording(session, recording, detail=False):
         rows = session.execute(select(Segment, func.json_array_length(Segment.alternates)).where(*condition)
                                .options(defer(Segment.alternates), defer(Segment.machine_history),
                                         defer(Segment.machine_text), defer(Segment.machine_english))
-                               .order_by(Segment.order, Segment.start)).all()
+                               .order_by(Segment.start, Segment.order, Segment.id)).all()
         segments = []
         for segment, alternate_count in rows:
             segment._alternate_count = alternate_count or 0
@@ -234,7 +255,7 @@ def serialize_recording(session, recording, detail=False):
     if detail:
         data["preview"] = preview
         data["segments"] = [serialize_segment(s, compact=True) for s in segments]
-        data["speakers"] = [{"id": s.id, "name": s.name, "recording_id": s.recording_id} for s in session.scalars(select(Speaker).where(Speaker.recording_id == recording.id))]
+        data["speakers"] = [{"id": s.id, "name": s.name, "recording_id": s.recording_id} for s in session.scalars(select(Speaker).where(Speaker.recording_id == recording.id).order_by(Speaker.id))]
         data["jobs"] = [serialize_job(job, include_log=False) for job in jobs]
     return data
 

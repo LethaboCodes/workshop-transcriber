@@ -18,13 +18,14 @@ from urllib.parse import quote, urlsplit
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select, text as sql_text
-from sqlalchemy.orm import Session
+from sqlalchemy import select, text as sql_text, tuple_
+from sqlalchemy.orm import Session, defer
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
 
 from .db import DATA_DIR, ROOT, AppSetting, Job, Recording, Segment, SessionLocal, Speaker, Upload, app_config, draft_snapshot, enqueue_job, init_db, recording_folder, serialize_job, serialize_recording, serialize_segment
 from .exports import export_transcript
+from .edits import edit_response, editor_delta, undo as undo_edit
 
 CHUNK_SIZE = 8 * 1024 * 1024
 LANGUAGES = {"en", "xh", "af"}
@@ -99,8 +100,20 @@ async def authentication(request, call_next):
 app.add_middleware(SessionMiddleware, secret_key=session_secret(), session_cookie="workshop_session", same_site="strict", https_only=os.getenv("COOKIE_SECURE", "false").lower() == "true", max_age=60 * 60 * 24 * 30)
 
 
-def db():
+def db(request: Request):
     with SessionLocal() as session:
+        session.info['editor_started']=time.time()
+        session.info['editor_delta']=request.query_params.get('editor_delta')=='1'
+        if request.method in {'POST','PATCH','DELETE'}:
+            path=request.url.path
+            if path.startswith(('/api/segments/','/api/speakers/')) or (path.startswith('/api/recordings/') and (request.method=='PATCH' or path.endswith(('/segments','/speakers','/replace','/translate-outdated')))):
+                from . import edits
+                action=path.rsplit('/',1)[-1]
+                session.info['edit_label']= {'merge':'Merge segments' if '/segments/' in path else 'Merge speakers','split':'Split segment','replace':'Find and replace','translate':'Translate text','translate-outdated':'Translate outdated text','retranscribe':'Re-transcribe text','choose-alternate':'Choose alternate text','segments':'Add segment','speakers':'Add speaker'}.get(action,
+                    'Delete segment' if request.method=='DELETE' else 'Edit speaker' if '/speakers/' in path else 'Edit recording' if '/recordings/' in path else 'Edit segment')
+            # Serialize short write transactions, including history and undo.
+            if session.info.get('edit_label') or path.endswith('/undo'):
+                session.connection().exec_driver_sql('BEGIN IMMEDIATE')
         yield session
 
 
@@ -133,13 +146,15 @@ def get_speaker(session, speaker_id):
 
 
 def active_segments(session, recording_id):
-    return session.scalars(select(Segment).where(Segment.recording_id == recording_id, Segment.is_deleted == False).order_by(Segment.start, Segment.order)).all()
+    return session.scalars(select(Segment).where(Segment.recording_id == recording_id, Segment.is_deleted == False)
+        .options(defer(Segment.alternates),defer(Segment.machine_history),defer(Segment.machine_text),defer(Segment.machine_english),defer(Segment.words))
+        .order_by(Segment.start, Segment.order, Segment.id)).all()
 
 
 def reorder(session, recording_id):
+    # Chronological ordering is indexed and computed on read. Gaps in the old
+    # integer order do not require rewriting thousands of unrelated rows.
     session.flush()
-    for index, segment in enumerate(active_segments(session, recording_id)):
-        segment.order = index
 
 
 def number(value, label, minimum=0, maximum=None):
@@ -285,6 +300,23 @@ def recording_detail(recording_id: str, session: Session = Depends(db)):
     return serialize_recording(session, get_recording(session, recording_id), True)
 
 
+@app.get("/api/recordings/{recording_id}/editor-state")
+def editor_state(recording_id: str, since: float = 0, session: Session = Depends(db)):
+    from .db import EditAction
+    cursor=time.time()
+    get_recording(session,recording_id)
+    changes=[]
+    for action in session.scalars(select(EditAction).where(EditAction.recording_id==recording_id,EditAction.updated_at>=since)):
+        changes.extend(action.changes)
+    return editor_delta(session,recording_id,changes,cursor)
+
+
+@app.post("/api/recordings/{recording_id}/undo")
+def undo_recording_edit(recording_id: str, data: dict = Body(default={}), session: Session = Depends(db)):
+    get_recording(session,recording_id)
+    return undo_edit(session,recording_id,data.get("id"))
+
+
 @app.get("/api/recordings/{recording_id}/coverage")
 def coverage_report(recording_id: str, session: Session = Depends(db)):
     get_recording(session,recording_id)
@@ -339,7 +371,7 @@ def patch_recording(recording_id: str, data: dict = Body(...), session: Session 
     if "settings" in data:
         recording.settings = recording_settings({**recording.settings, **data["settings"]})
     session.commit()
-    return serialize_recording(session, recording, True)
+    return edit_response(session,recording_id,{"id":recording_id}) if session.info.get("editor_delta") else serialize_recording(session,recording,True)
 
 
 @app.delete("/api/recordings/{recording_id}")
@@ -597,7 +629,7 @@ def patch_segment(segment_id: str, data: dict = Body(...), session: Session = De
     result = serialize_segment(segment)
     if job:
         result["job"] = serialize_job(job)
-    return result
+    return edit_response(session,segment.recording_id,result)
 
 
 def split_string(value, ratio):
@@ -643,24 +675,23 @@ def split_segment(segment_id: str, data: dict = Body(...), session: Session = De
             enqueue_job(session, child.recording_id, "retranscribe", {"segment_id": child.id, "language": child.language})
     reorder(session, segment.recording_id)
     session.commit()
-    return {"segments": [serialize_segment(left), serialize_segment(right)]}
+    return edit_response(session,segment.recording_id,{"segments": [serialize_segment(left,compact=True), serialize_segment(right,compact=True)]})
 
 
 @app.post("/api/segments/{segment_id}/merge")
 def merge_segment(segment_id: str, session: Session = Depends(db)):
     segment = get_segment(session, segment_id)
-    segments = active_segments(session, segment.recording_id)
-    index = next(index for index, item in enumerate(segments) if item.id == segment_id)
-    if index == len(segments) - 1:
+    following = session.scalar(select(Segment).where(Segment.recording_id==segment.recording_id,Segment.is_deleted==False,
+        tuple_(Segment.start,Segment.order,Segment.id)>tuple_(segment.start,segment.order,segment.id)).order_by(Segment.start,Segment.order,Segment.id).limit(1))
+    if following is None:
         raise HTTPException(400, "There is no following segment to merge.")
-    following = segments[index + 1]
     merged = derived_segment(segment, end=max(segment.end, following.end), edited_text=" ".join(filter(None, [segment.edited_text, following.edited_text])), machine_text=" ".join(filter(None, [segment.machine_text, following.machine_text])), machine_english=" ".join(filter(None, [segment.machine_english, following.machine_english])), edited_english=" ".join(filter(None, [segment.edited_english, following.edited_english])), words=list(segment.words or []) + list(following.words or []), alternates=[], english_outdated=segment.english_outdated or following.english_outdated, english_machine=segment.english_machine or following.english_machine)
     merged.machine_history += list(following.machine_history or []) + [draft_snapshot(following)]
     segment.is_deleted = following.is_deleted = True
     session.add(merged)
     reorder(session, segment.recording_id)
     session.commit()
-    return serialize_segment(merged)
+    return edit_response(session,merged.recording_id,serialize_segment(merged,compact=True))
 
 
 @app.delete("/api/segments/{segment_id}")
@@ -670,7 +701,7 @@ def delete_segment(segment_id: str, session: Session = Depends(db)):
     segment.revision += 1
     reorder(session, segment.recording_id)
     session.commit()
-    return {"deleted": True}
+    return edit_response(session,segment.recording_id,{"deleted": True})
 
 
 @app.post("/api/recordings/{recording_id}/segments")
@@ -684,7 +715,7 @@ def add_segment(recording_id: str, data: dict = Body(...), session: Session = De
     session.add(segment)
     reorder(session, recording_id)
     session.commit()
-    return serialize_segment(segment)
+    return edit_response(session,segment.recording_id,serialize_segment(segment,compact=True))
 
 
 @app.post("/api/segments/{segment_id}/retranscribe")
@@ -698,7 +729,7 @@ def retranscribe_segment(segment_id: str, data: dict = Body(default={}), session
             raise HTTPException(400, "Unknown ASR model.")
     job = enqueue_job(session, segment.recording_id, "retranscribe", {"segment_id": segment.id, "language": language, "model_key": data.get("model_key")})
     session.commit()
-    return {"job": serialize_job(job), "segment": serialize_segment(segment)}
+    return edit_response(session,segment.recording_id,{"job": serialize_job(job,include_log=False)})
 
 
 @app.post("/api/segments/{segment_id}/translate")
@@ -706,18 +737,18 @@ def translate_segment(segment_id: str, session: Session = Depends(db)):
     segment = get_segment(session, segment_id)
     job = enqueue_job(session, segment.recording_id, "translate", {"segment_ids": [segment_id]})
     session.commit()
-    return {"job": serialize_job(job), "segment": serialize_segment(segment)}
+    return edit_response(session,segment.recording_id,{"job": serialize_job(job,include_log=False)})
 
 
 @app.post("/api/recordings/{recording_id}/translate-outdated")
 def translate_outdated(recording_id: str, session: Session = Depends(db)):
     get_recording(session, recording_id)
-    ids = [segment.id for segment in active_segments(session, recording_id) if segment.english_outdated]
+    ids = list(session.scalars(select(Segment.id).where(Segment.recording_id==recording_id,Segment.is_deleted==False,Segment.english_outdated==True)))
     if not ids:
         return {"job": None, "count": 0}
     job = enqueue_job(session, recording_id, "translate", {"segment_ids": ids})
     session.commit()
-    return {"job": serialize_job(job), "count": len(ids)}
+    return edit_response(session,recording_id,{"job": serialize_job(job,include_log=False), "count": len(ids)})
 
 
 @app.post("/api/segments/{segment_id}/choose-alternate")
@@ -746,7 +777,7 @@ def choose_alternate(segment_id: str, data: dict = Body(...), session: Session =
         segment.english_outdated = True
         enqueue_job(session, segment.recording_id, "translate", {"segment_ids": [segment.id]})
     session.commit()
-    return serialize_segment(segment)
+    return edit_response(session,segment.recording_id,serialize_segment(segment,compact=True))
 
 
 @app.post("/api/recordings/{recording_id}/replace")
@@ -779,7 +810,7 @@ def find_replace(recording_id: str, data: dict = Body(...), session: Session = D
             segment.revision += 1
             segment.review_status = "unreviewed"
     session.commit()
-    return {"replacements": changes}
+    return edit_response(session,recording_id,{"replacements": changes})
 
 
 @app.post("/api/recordings/{recording_id}/speakers")
@@ -791,7 +822,7 @@ def add_speaker(recording_id: str, data: dict = Body(...), session: Session = De
     speaker = Speaker(recording_id=recording_id, name=name)
     session.add(speaker)
     session.commit()
-    return {"id": speaker.id, "name": speaker.name, "recording_id": recording_id}
+    return edit_response(session,recording_id,{"id": speaker.id, "name": speaker.name, "recording_id": recording_id})
 
 
 @app.patch("/api/speakers/{speaker_id}")
@@ -802,7 +833,7 @@ def rename_speaker(speaker_id: str, data: dict = Body(...), session: Session = D
         raise HTTPException(400, "Enter a speaker name.")
     speaker.name = name
     session.commit()
-    return {"id": speaker.id, "name": name, "recording_id": speaker.recording_id}
+    return edit_response(session,speaker.recording_id,{"id": speaker.id, "name": name, "recording_id": speaker.recording_id})
 
 
 @app.post("/api/speakers/{speaker_id}/merge")
@@ -811,11 +842,11 @@ def merge_speakers(speaker_id: str, data: dict = Body(...), session: Session = D
     target = get_speaker(session, str(data.get("target_id", "")))
     if source.id == target.id or source.recording_id != target.recording_id:
         raise HTTPException(400, "Choose a different speaker from this recording.")
-    for segment in session.scalars(select(Segment).where(Segment.speaker_id == source.id)):
+    for segment in session.scalars(select(Segment).where(Segment.speaker_id == source.id).options(defer(Segment.words),defer(Segment.alternates),defer(Segment.machine_history),defer(Segment.machine_text),defer(Segment.machine_english))):
         segment.speaker_id = target.id
     session.delete(source)
     session.commit()
-    return {"id": target.id, "name": target.name, "recording_id": target.recording_id}
+    return edit_response(session,target.recording_id,{"id": target.id, "name": target.name, "recording_id": target.recording_id})
 
 
 @app.get("/api/search")

@@ -2,7 +2,10 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import WaveSurfer from 'wavesurfer.js';
 import { api, CHUNK_SIZE, LANGUAGES, time, duration, size, date, asArray, pendingUploads, rememberUpload, forgetUpload, fileStore } from './api.js';
 
+const PAGE_SIZE = 50;
 const ICONS = {
+  undo: 'M9 4 3 10l6 6M3 10h11a7 7 0 0 1 0 14',
+  up: 'M12 20V4m-7 7 7-7 7 7',
   wave: 'M3 10v4m4-8v12m5-16v20m5-16v12m4-8v4',
   recordings: 'M4 4h6l2 3h8v13H4zM8 12h8m-8 4h5',
   search: 'M21 21l-5-5M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',
@@ -230,36 +233,79 @@ function Editor({ id, initialTime, initialSegment, navigate, models, settings, n
   const [modal, setModal] = useState(null), [busy, setBusy] = useState({}), [saveState, setSaveState] = useState('saved'), [logOpen, setLogOpen] = useState(false);
   const [cursor, setCursor] = useState({ id: null, position: 0 });
   const [page, setPage] = useState(0);
+  const mutationVersion = useRef(0), actionRequests = useRef(new Map());
   const currentTimeRef = useRef(currentTime), cursorRef = useRef(cursor), visibleRef = useRef([]), tableTop = useRef(null);
   currentTimeRef.current = currentTime; cursorRef.current = cursor;
   const pending = useRef(new Map()), inFlight = useRef(new Map()), player = useRef(null), recordingRef = useRef(null), rowRefs = useRef(new Map()), version = useRef(0);
   recordingRef.current = recording;
-  const load = useCallback(async () => {
+  const applyDelta = useCallback(delta => {
+    if (!delta) return;
+    const candidates = delta.removed || [];
+    const removals = delta.removed_revisions || {};
+    const previous = recordingRef.current;
+    if (previous && candidates.length) setActiveId(activeId => {
+      const removed=new Set(candidates.filter(id => removals[id] == null || removals[id] >= (previous.segments.find(row => row.id===id)?.revision ?? -1)));
+      if (!removed.has(activeId)) return activeId;
+      const index=previous.segments.findIndex(row => row.id===activeId);
+      return delta.upsert?.find(row => !removed.has(row.id))?.id || previous.segments.slice(index+1).find(row => !removed.has(row.id))?.id || previous.segments.slice(0,index).reverse().find(row => !removed.has(row.id))?.id || null;
+    });
+    setRecording(current => {
+      if (!current) return current;
+      const tombstones={...current.removedRevisions};
+      const incoming = new Map((delta.upsert || []).filter(row => row.revision>(tombstones[row.id] ?? -1)).map(row => [row.id,row]));
+      const revisions=new Map(current.segments.map(row => [row.id,row.revision]));
+      const removed=new Set(candidates.filter(id => removals[id] == null ? (delta.editor_cursor || 0)>=(current.editor_cursor || 0) : removals[id]>=Math.max(revisions.get(id) ?? -1,tombstones[id] ?? -1)));
+      for (const id of removed) tombstones[id]=removals[id] ?? revisions.get(id) ?? -1;
+      for (const id of incoming.keys()) if (!removed.has(id)) delete tombstones[id];
+      const changing=removed.size>0 || incoming.size>0;
+      const rows=changing ? [] : current.segments;
+      for (const row of (changing ? current.segments : []) || []) {
+        if (removed.has(row.id)) continue;
+        const updated=incoming.get(row.id); incoming.delete(row.id);
+        rows.push(updated && updated.revision >= row.revision ? { ...row,...updated,...(pending.current.get(row.id)?.patch || {}) } : row);
+      }
+      for (const row of incoming.values()) if (!removed.has(row.id)) rows.push({ ...row,...(pending.current.get(row.id)?.patch || {}) });
+      if (changing) rows.sort((a,b) => a.start-b.start || a.order-b.order || a.id.localeCompare(b.id));
+      const fresh=(delta.editor_cursor || 0)>=(current.editor_cursor || 0);
+      const sameSpeakers=delta.speakers?.length===current.speakers.length && delta.speakers.every((speaker,i) => speaker.id===current.speakers[i].id && speaker.name===current.speakers[i].name);
+      return { ...current,...(fresh ? delta.metadata : {}),segments:rows,
+        ...(fresh ? { speakers:sameSpeakers ? current.speakers : delta.speakers || current.speakers,jobs:delta.jobs || current.jobs,undo:delta.undo || current.undo } : {}),
+        removedRevisions:tombstones,editor_cursor:Math.max(current.editor_cursor || 0,delta.editor_cursor || 0) };
+    });
+  }, []);
+  const load = useCallback(async (forceFull = false) => {
+    const generation=mutationVersion.current;
     try {
+      const current=recordingRef.current;
+      if (forceFull!==true && current?.segments?.length && current.status==='ready' && current.editor_cursor && !current.jobs?.some(job => job.kind==='pipeline' && ['queued','processing','running'].includes(job.status))) {
+        const delta=await api(`/recordings/${id}/editor-state?since=${current.editor_cursor}`);applyDelta(delta);setError('');return delta;
+      }
       const fresh = await api(`/recordings/${id}`);
+      if (generation!==mutationVersion.current) return null;
       fresh.segments = (fresh.segments || []).map(segment => ({ ...segment, ...(pending.current.get(segment.id)?.patch || {}) }));
       fresh.speakers ||= []; fresh.jobs ||= [];
       setRecording(fresh); setError('');
       setActiveId(current => current && fresh.segments.some(segment => segment.id === current) ? current : fresh.segments.find(segment => initialTime >= segment.start && initialTime < segment.end)?.id || fresh.segments[0]?.id || null);
       return fresh;
     } catch (e) { setError(e.message); return null; }
-  }, [id, initialTime]);
+  }, [id, initialTime,applyDelta]);
   useEffect(() => { load(); const update = () => load(); window.addEventListener('recording-updated', update); const timer = setInterval(() => { const rec = recordingRef.current; if (rec && (['queued', 'processing', 'uploading', 'running'].includes(rec.status) || rec.jobs?.some(job => ['queued', 'running', 'processing'].includes(job.status)))) load(); }, 2500); return () => { clearInterval(timer); window.removeEventListener('recording-updated', update); }; }, [load]);
   const flush = useCallback(async segmentId => {
     if (inFlight.current.has(segmentId)) { await inFlight.current.get(segmentId); if (pending.current.has(segmentId)) return flush(segmentId); return; }
     const entry = pending.current.get(segmentId);
     if (!entry) return;
     clearTimeout(entry.timer);
-    const promise = api(`/segments/${segmentId}`, { method: 'PATCH', body: entry.patch });
+    mutationVersion.current++;
+    const promise = api(`/segments/${segmentId}?editor_delta=1`, { method: 'PATCH', body: entry.patch });
     inFlight.current.set(segmentId, promise);
     try {
       const updated = await promise;
       if (pending.current.get(segmentId)?.version === entry.version) pending.current.delete(segmentId);
-      setRecording(current => current ? { ...current, segments: current.segments.map(segment => segment.id === segmentId ? { ...segment, ...updated, ...(pending.current.get(segmentId)?.patch || {}) } : segment) } : current);
+      applyDelta(updated.editor);
       if (!pending.current.size) setSaveState('saved');
     } catch (e) { setSaveState('error'); notify(`Changes are still in this editor: ${e.message}. Retry saving before leaving.`, true); throw e; }
     finally { inFlight.current.delete(segmentId); }
-  }, [notify]);
+  }, [notify,applyDelta]);
   const flushAll = useCallback(async () => { await Promise.all([...pending.current.keys()].map(flush)); }, [flush]);
   const save = useCallback((segmentId, patch, immediate = false) => {
     const previous = pending.current.get(segmentId);
@@ -270,20 +316,47 @@ function Editor({ id, initialTime, initialSegment, navigate, models, settings, n
     setRecording(current => ({ ...current, segments: current.segments.map(segment => segment.id === segmentId ? { ...segment, ...patch } : segment) }));
   }, [flush]);
   useEffect(() => { const leave = event => { if (pending.current.size) { event.preventDefault(); event.returnValue = ''; } }; window.addEventListener('beforeunload', leave); return () => { window.removeEventListener('beforeunload', leave); for (const entry of pending.current.values()) clearTimeout(entry.timer); flushAll().catch(() => {}); }; }, [flushAll]);
-  const action = useCallback(async (key, path, body, method = 'POST', message) => {
-    setBusy(current => ({ ...current, [key]: true }));
-    try { await flushAll(); const result = await api(path, { method, ...(body !== undefined ? { body } : {}) }); await load(); if (message) notify(message); return result; }
-    catch (e) { notify(e.message, true); return null; }
-    finally { setBusy(current => ({ ...current, [key]: false })); }
-  }, [flushAll, load, notify]);
+  const action = useCallback((key, path, body, method = 'POST', message) => {
+    if (actionRequests.current.has(key)) return actionRequests.current.get(key);
+    const request=(async () => {
+      setBusy(current => ({ ...current, [key]: true }));
+      try {
+        await flushAll();mutationVersion.current++;
+        const result=await api(`${path}${path.includes('?') ? '&' : '?'}editor_delta=1`, { method,...(body!==undefined ? { body } : {}) });
+        if (result?.editor) {
+          applyDelta(result.editor);
+          const selected=result.editor.upsert?.find(row => row.id===result.id || row.id===result.segments?.[0]?.id);
+          if (selected) setActiveId(selected.id);
+        } else await load(true);
+        if (message) notify(message);
+        return result;
+      } catch (error) { notify(error.message,true);return null; }
+      finally { actionRequests.current.delete(key);setBusy(current => ({ ...current,[key]:false })); }
+    })();
+    actionRequests.current.set(key,request);return request;
+  }, [flushAll,load,notify,applyDelta]);
+  const undoSaved = useCallback(async () => {
+    if (actionRequests.current.size) return;
+    setBusy(current => ({ ...current,undo:true }));
+    try {
+      await flushAll();
+      const state=await api(`/recordings/${id}/editor-state?since=${recordingRef.current?.editor_cursor || 0}`);applyDelta(state);
+      if (!state.undo?.available) { notify('There are no saved edits to undo.');return; }
+      mutationVersion.current++;
+      const result=await api(`/recordings/${id}/undo`, { method:'POST',body:{ id:state.undo.id } });applyDelta(result.editor);
+      if (result.editor.upsert?.length) setActiveId(result.editor.upsert[0].id);
+      notify(`${result.label} undone.`);
+    } catch(error) { notify(error.message,true); }
+    finally { setBusy(current => ({ ...current,undo:false })); }
+  }, [id,flushAll,applyDelta,notify]);
   const segments = useMemo(() => recording?.segments || [], [recording?.segments]);
   const active = segments.find(segment => segment.id === activeId);
   const visible = useMemo(() => segments.filter(segment => (filter.status === 'all' || segment.review_status === filter.status) && (filter.speaker === 'all' || String(segment.speaker_id) === filter.speaker) && (filter.language === 'all' || segment.language === filter.language) && (!filter.low || (segment.words?.some(word => word.probability != null && word.probability < threshold) || (segment.confidence ?? 1) < threshold)) && (!filter.text || `${segment.edited_text ?? segment.text ?? ''} ${segment.edited_english ?? segment.english ?? ''}`.toLowerCase().includes(filter.text.toLowerCase()))), [segments, filter, threshold]);
   visibleRef.current = visible;
-  const pageCount = Math.max(1, Math.ceil(visible.length / 30)), currentPage = Math.min(page, pageCount - 1);
-  const pageSegments = useMemo(() => visible.slice(currentPage * 30, (currentPage + 1) * 30), [visible, currentPage]);
+  const pageCount = Math.max(1, Math.ceil(visible.length / PAGE_SIZE)), currentPage = Math.min(page, pageCount - 1);
+  const pageSegments = useMemo(() => visible.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE), [visible, currentPage]);
   useEffect(() => setPage(0), [filter, threshold]);
-  useEffect(() => { const index = visibleRef.current.findIndex(segment => segment.id === activeId); if (index >= 0) setPage(Math.floor(index / 30)); }, [activeId]);
+  useEffect(() => { const index = visibleRef.current.findIndex(segment => segment.id === activeId); if (index >= 0) setPage(Math.floor(index / PAGE_SIZE)); }, [activeId]);
   useEffect(() => { const frame = requestAnimationFrame(() => rowRefs.current.get(activeId)?.scrollIntoView({ block: 'nearest', behavior: 'auto' })); return () => cancelAnimationFrame(frame); }, [activeId, currentPage]);
   const rowHandlers = useMemo(() => ({
     register: (segmentId, element) => element ? rowRefs.current.set(segmentId, element) : rowRefs.current.delete(segmentId),
@@ -294,7 +367,7 @@ function Editor({ id, initialTime, initialSegment, navigate, models, settings, n
     action: (segmentId, suffix, body, message) => action(segmentId, `/segments/${segmentId}${suffix}`, body, suffix === '' ? 'PATCH' : 'POST', message),
     compare: segment => setModal({ type: 'compare', segment }),
     split: (segment, position) => { const point = currentTimeRef.current, cursor = cursorRef.current; setActiveId(segment.id); setModal({ type: 'split', segment, position: position ?? (cursor.id === segment.id ? cursor.position : Math.floor((segment.edited_text || '').length / 2)), time: point > segment.start && point < segment.end ? point : null }); },
-    remove: segment => setModal({ type: 'delete-segment', segment }),
+    remove: segment => action(segment.id,`/segments/${segment.id}`,undefined,'DELETE','Segment deleted. Undo is available.'),
   }), [save, flush, action]);
   const reviewed = useMemo(() => segments.filter(segment => segment.review_status === 'reviewed').length, [segments]);
   const outdated = useMemo(() => segments.filter(segment => segment.english_outdated).length, [segments]);
@@ -310,11 +383,13 @@ function Editor({ id, initialTime, initialSegment, navigate, models, settings, n
   };
   useEffect(() => {
     const keyboard = event => {
-      if (modal || !recording?.segments?.length || event.target.closest('[role="dialog"]')) return;
+      if (modal || event.target.closest('[role="dialog"]')) return;
       const typing = event.target.matches('input,textarea,select,[contenteditable="true"]');
+      if (event.ctrlKey && !event.shiftKey && event.key.toLowerCase()==='z' && !typing) { event.preventDefault();undoSaved();return; }
+      if (!recording?.segments?.length) return;
       if (event.key === 'Tab' && !event.shiftKey && !event.ctrlKey && !event.altKey && !typing) { event.preventDefault(); player.current?.toggle(); }
       else if (event.ctrlKey && event.key === 'Enter') { event.preventDefault(); markReviewed(); }
-      else if (event.altKey && ['ArrowLeft', 'ArrowRight'].includes(event.key)) { event.preventDefault(); player.current?.seek(Math.max(0, currentTime + (event.key === 'ArrowLeft' ? -2 : 2))); }
+      else if (event.altKey && ['ArrowLeft', 'ArrowRight'].includes(event.key)) { event.preventDefault(); player.current?.seek(Math.max(0, currentTime + (event.key === 'ArrowLeft' ? -5 : 5))); }
       else if (event.ctrlKey && ['j', 'k'].includes(event.key.toLowerCase())) { event.preventDefault(); nextSegment(event.key.toLowerCase() === 'j' ? -1 : 1); }
       else if (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 's') { event.preventDefault(); openSplit(); }
       else if (event.ctrlKey && event.key.toLowerCase() === 'm') { event.preventDefault(); if (active) action(active.id, `/segments/${active.id}/merge`, {}, 'POST', 'Segments merged.'); }
@@ -328,7 +403,7 @@ function Editor({ id, initialTime, initialSegment, navigate, models, settings, n
   if (!recording) return <div className="page">{error ? <ErrorNotice message={error} retry={load}/> : <Loading>Opening recording…</Loading>}</div>;
   const job = recording.jobs?.find(item => ['running', 'queued', 'processing'].includes(item.status)) || recording.jobs?.[0];
   const hasAudio = recording.status !== 'uploading';
-  return <div className="editor-page"><header className="editor-header"><div className="editor-breadcrumb"><a href="#/recordings"><Icon name="back" size={16}/>Recordings</a><span>/</span><span>{recording.workshop || 'Workshop'}</span></div><div className="editor-title-row"><div><h1>{recording.title}</h1><p>{date(recording.date || recording.created_at)}<i>·</i>{duration(recording.duration)}<i>·</i>{recording.speakers.length || recording.preview?.speakers?.length || 0} speakers<Badge status={recording.status}/></p></div><div className="editor-header-actions"><button className={`save-state ${saveState}`} onClick={() => saveState === 'error' && flushAll().catch(() => {})} disabled={saveState !== 'error'}><Icon name={saveState === 'error' ? 'alert' : saveState === 'saving' ? 'refresh' : 'check'} size={14}/>{saveState === 'error' ? 'Retry saving' : saveState === 'saving' ? 'Saving…' : 'All changes saved'}</button><Button icon="settings" onClick={() => setModal({ type: 'recording-settings' })} aria-label="Recording settings" title="Recording settings"/><Button icon="download" onClick={() => setModal({ type: 'export' })} disabled={!segments.length && !recording.preview?.segments?.length}>Preview & export</Button></div></div></header>
+  return <div className="editor-page"><header className="editor-header"><div className="editor-breadcrumb"><a href="#/recordings"><Icon name="back" size={16}/>Recordings</a><span>/</span><span>{recording.workshop || 'Workshop'}</span></div><div className="editor-title-row"><div><h1>{recording.title}</h1><p>{date(recording.date || recording.created_at)}<i>·</i>{duration(recording.duration)}<i>·</i>{recording.speakers.length || recording.preview?.speakers?.length || 0} speakers<Badge status={recording.status}/></p></div><div className="editor-header-actions"><button className={`save-state ${saveState}`} onClick={() => saveState === 'error' && flushAll().catch(() => {})} disabled={saveState !== 'error'}><Icon name={saveState === 'error' ? 'alert' : saveState === 'saving' ? 'refresh' : 'check'} size={14}/>{saveState === 'error' ? 'Retry saving' : saveState === 'saving' ? 'Saving…' : 'All changes saved'}</button><Button icon="undo" busy={busy.undo} disabled={!recording.undo?.available || Object.values(busy).some(Boolean)} onClick={undoSaved} title={recording.undo?.available ? `Undo: ${recording.undo.label} (Ctrl+Z)` : "Undo starts with edits made after this update"}>Undo</Button><Button icon="settings" onClick={() => setModal({ type: 'recording-settings' })} aria-label="Recording settings" title="Recording settings"/><Button icon="download" onClick={() => setModal({ type: 'export' })} disabled={!segments.length && !recording.preview?.segments?.length}>Preview & export</Button></div></div></header>
     {error && <ErrorNotice message={error} retry={load}/>}
     {uploads[id] && <UploadNotice id={id} upload={uploads[id]} resume={resumeUpload} pause={pauseUpload}/>}
     {recording.status === 'uploading' && !uploads[id] && <UploadNotice id={id} upload={{ status: 'needs-file', name: recording.filename || 'your recording', progress: 0 }} resume={resumeUpload} pause={pauseUpload}/>}
@@ -338,7 +413,8 @@ function Editor({ id, initialTime, initialSegment, navigate, models, settings, n
     {!segments.length && recording.preview && <StagePreview preview={recording.preview} seek={seekPreview}/>}
     {segments.length > 0 ? <><div className="editor-toolbar"><div className="editor-tabs"><button className={!logOpen ? 'selected' : ''} onClick={() => setLogOpen(false)}>Transcript <span>{segments.length}</span></button><button className={logOpen ? 'selected' : ''} onClick={() => setLogOpen(value => !value)}>Processing log</button></div><div className="editor-tools"><span className="review-count"><i style={{ '--progress': `${reviewed / segments.length * 100}%` }}/><strong>{reviewed}</strong> / {segments.length} reviewed</span><button className="text-button" onClick={() => setModal({ type: 'new-transcription' })}><Icon name="refresh" size={16}/>New transcription</button><button className="text-button" onClick={() => setModal({ type: 'speakers' })}><Icon name="users" size={16}/>Speakers</button><button className="icon-button" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts" onClick={() => setModal({ type: 'help' })}><Icon name="help" size={18}/></button></div></div>
       <div className="transcript-controls"><div className="transcript-filters"><div className="search-input"><Icon name="search" size={15}/><input aria-label="Find in this transcript" placeholder="Find in transcript…" value={filter.text} onChange={event => setFilter({ ...filter, text: event.target.value })}/></div><select aria-label="Filter review status" value={filter.status} onChange={event => setFilter({ ...filter, status: event.target.value })}><option value="all">All statuses</option><option value="unreviewed">Unreviewed</option><option value="reviewed">Reviewed</option><option value="flagged">Flagged</option></select><select aria-label="Filter speaker" value={filter.speaker} onChange={event => setFilter({ ...filter, speaker: event.target.value })}><option value="all">All speakers</option>{recording.speakers.map(speaker => <option key={speaker.id} value={speaker.id}>{speaker.name}</option>)}</select><select aria-label="Filter language" value={filter.language} onChange={event => setFilter({ ...filter, language: event.target.value })}><option value="all">All languages</option>{Object.entries(LANGUAGES).map(([code, name]) => <option key={code} value={code}>{name}</option>)}</select><button className="text-button" onClick={() => setModal({ type: 'replace' })}>Find & replace</button></div><div className="confidence-controls"><label><input type="checkbox" checked={filter.low} onChange={event => setFilter({ ...filter, low: event.target.checked })}/>Low confidence only</label><span className="confidence-label">Highlight below <b>{Math.round(threshold * 100)}%</b></span><input type="range" min="0" max="1" step="0.05" value={threshold} aria-label="Low confidence threshold" onChange={event => setThreshold(Number(event.target.value))}/><div className="low-jumps"><button className="icon-button" onClick={() => lowJump(-1)} title="Previous low-confidence word" aria-label="Previous low-confidence word"><Icon name="back" size={15}/></button><button className="icon-button" onClick={() => lowJump(1)} title="Next low-confidence word" aria-label="Next low-confidence word"><Icon name="arrow" size={15}/></button></div><span className="controls-spacer"/>{outdated > 0 && <button className="text-button amber" disabled={busy.translate} onClick={() => action('translate', `/recordings/${id}/translate-outdated`, {}, 'POST', 'Refreshing outdated translations in the background.')}><Icon name="refresh" size={14}/>{busy.translate ? 'Queuing…' : `Refresh ${outdated} outdated translation${outdated === 1 ? '' : 's'}`}</button>}<button className="text-button" disabled={busy.add} onClick={async () => { const result = await action('add', `/recordings/${id}/segments`, { start: currentTime }, 'POST'); if (result?.id) setActiveId(result.id); }}><Icon name="plus" size={16}/>Add at playhead</button></div></div>
-      <div className="transcript-table" ref={tableTop}><div className="transcript-head"><span>TIME / SPEAKER</span><span>ORIGINAL TRANSCRIPT <small>Click a word to listen</small></span><span>ENGLISH TRANSLATION</span><span>REVIEW</span></div>{visible.length ? pageSegments.map(segment => <SegmentRow key={segment.id} segment={segment} speakers={recording.speakers} active={segment.id === activeId} currentTime={segment.id === activeId ? currentTime : -1} threshold={threshold} busy={busy[segment.id]} handlers={rowHandlers} canMerge={segment.id !== segments[segments.length - 1]?.id}/>) : <Empty icon="search" title="No matching segments" action={<Button onClick={() => setFilter({ status: 'all', speaker: 'all', language: 'all', text: '', low: false })}>Clear filters</Button>}>Adjust the filters to see more of this conversation.</Empty>}</div><div className="transcript-pagination"><Button disabled={currentPage === 0} onClick={() => { setPage(currentPage - 1); tableTop.current?.scrollIntoView({ block: 'start' }); }}>Previous</Button><span>Page {currentPage + 1} of {pageCount} · Showing {visible.length ? currentPage * 30 + 1 : 0}–{Math.min((currentPage + 1) * 30, visible.length)} of {visible.length} matching segments</span><Button disabled={currentPage + 1 >= pageCount} onClick={() => { setPage(currentPage + 1); tableTop.current?.scrollIntoView({ block: 'start' }); }}>Next</Button></div><div className="editor-bottom"><span>{visible.length} of {segments.length} segments<span className="bottom-divider">·</span>Machine drafts need a human ear.</span><span><kbd>Tab</kbd> Play / pause <kbd>Ctrl ↵</kbd> Review & next</span></div>
+      <div className="transcript-table" ref={tableTop}><div className="transcript-head"><span>TIME / SPEAKER</span><span>ORIGINAL TRANSCRIPT <small>Click a word to listen</small></span><span>ENGLISH TRANSLATION</span><span>REVIEW</span></div>{visible.length ? pageSegments.map(segment => <SegmentRow key={segment.id} segment={segment} speakers={recording.speakers} active={segment.id === activeId} currentTime={segment.id === activeId ? currentTime : -1} threshold={threshold} busy={busy[segment.id]} handlers={rowHandlers} canMerge={segment.id !== segments[segments.length - 1]?.id}/>) : <Empty icon="search" title="No matching segments" action={<Button onClick={() => setFilter({ status: 'all', speaker: 'all', language: 'all', text: '', low: false })}>Clear filters</Button>}>Adjust the filters to see more of this conversation.</Empty>}</div><TranscriptPages page={currentPage} count={visible.length} onChange={next => { setPage(next);setFollow(false);tableTop.current?.scrollIntoView({ block:'start',behavior:'auto' }); }}/><div className="editor-bottom"><span className="editor-count"><b>{visible.length.toLocaleString()}</b> of {segments.length.toLocaleString()} segments</span><span className="editor-reading-note">Machine drafts need a human ear.</span><span className="editor-shortcuts"><span><kbd>Tab</kbd> Play / pause</span><span><kbd>Ctrl ↵</kbd> Review & next</span><span><kbd>Ctrl Z</kbd> Undo saved edit</span></span></div>
+
     </> : recording.status === 'ready' ? <Empty title="No speech segments found" action={<Button icon="plus" onClick={() => action('add', `/recordings/${id}/segments`, { start: currentTime }, 'POST')}>Add a segment</Button>}>You can add a segment manually or adjust the processing preferences and retry the job.</Empty> : recording.status === 'uploading' ? <div className="upload-wait"><Icon name="wave" size={36}/><h2>Your next conversation starts here.</h2><p>When the upload finishes, transcription starts automatically.</p></div> : null}
     {modal?.type === 'new-transcription' && <NewTranscriptionModal close={() => setModal(null)} create={async () => { await flushAll(); const result = await api(`/recordings/${id}/transcriptions`, { method: 'POST' }); onUpdated(); navigate(`/recordings/${result.id}`); }} notify={notify}/>}
     {modal?.type === 'help' && <ShortcutModal close={() => setModal(null)}/>}
@@ -350,6 +426,7 @@ function Editor({ id, initialTime, initialSegment, navigate, models, settings, n
     {modal?.type === 'recording-settings' && <RecordingPreferences recording={recording} close={() => setModal(null)} save={async values => { const result = await action('preferences', `/recordings/${id}`, values, 'PATCH', 'Recording preferences saved.'); if (result) { setModal(null); onUpdated(); } }} remove={() => setModal({ type: 'delete-recording' })}/>} 
     {modal?.type === 'delete-segment' && <ConfirmDelete title="Delete this segment?" close={() => setModal(null)} busy={busy[modal.segment.id]} remove={async () => { const result = await action(modal.segment.id, `/segments/${modal.segment.id}`, undefined, 'DELETE'); if (result !== null) setModal(null); else { await load(); setModal(null); } }}>The transcript from {time(modal.segment.start)} to {time(modal.segment.end)} will be removed. The audio stays intact.</ConfirmDelete>}
     {modal?.type === 'delete-recording' && <ConfirmDelete title="Delete this recording?" close={() => setModal(null)} busy={busy.delete} remove={async () => { setBusy(current => ({ ...current, delete: true })); try { await api(`/recordings/${id}`, { method: 'DELETE' }); onDelete(id); navigate('/recordings'); notify('Recording and its files deleted.'); } catch (e) { notify(e.message, true); setBusy(current => ({ ...current, delete: false })); } }}>“{recording.title}”, its audio files, transcript and processing history will be permanently deleted.</ConfirmDelete>}
+    <ScrollToTop/>
   </div>;
 }
 
@@ -357,7 +434,7 @@ const StagePreview = React.memo(function StagePreview({ preview, seek }) {
   const [query, setQuery] = useState(''), [page, setPage] = useState(0);
   const speakers = Object.fromEntries((preview.speakers || []).map(speaker => [speaker.id, speaker.name]));
   const rows = (preview.segments || []).filter(row => !query || `${row.text} ${row.english} ${speakers[row.speaker] || ''}`.toLowerCase().includes(query.toLowerCase()));
-  const pages = Math.max(1, Math.ceil(rows.length / 40)), current = Math.min(page, pages - 1);
+  const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE)), current = Math.min(page, pages - 1);
   const complete = preview.recognition_total > 0 && preview.recognition_done === preview.recognition_total;
   const translated = (preview.segments || []).filter(row => row.translation_ready).length;
   return <section className="stage-preview" aria-label="Available processing results">
@@ -366,13 +443,13 @@ const StagePreview = React.memo(function StagePreview({ preview, seek }) {
     <div className="stage-preview-speakers">{(preview.speakers || []).map(speaker => <span key={speaker.id}>{speaker.name}</span>)}</div>
     <label className="stage-preview-search">Search available draft<input type="search" value={query} onChange={event => { setQuery(event.target.value); setPage(0); }} placeholder="Find words or a speaker…"/></label>
     <div className="stage-preview-columns"><span>TIME / SPEAKER</span><span>ORIGINAL TRANSCRIPT</span><span>ENGLISH TRANSLATION</span></div>
-    {rows.slice(current * 40, (current + 1) * 40).map(row => <article className="stage-preview-row" key={row.index}>
+    {rows.slice(current * PAGE_SIZE, (current + 1) * PAGE_SIZE).map(row => <article className="stage-preview-row" key={row.index}>
       <div><button className="timestamp" onClick={() => seek(row.start)}>{time(row.start)}</button><small>{speakers[row.speaker] || row.speaker}</small><small>{LANGUAGES[row.language] || row.language} · {row.model || 'Awaiting recognition'}</small></div>
       <div><p>{row.words?.length ? row.words.map((word, index) => <React.Fragment key={index}><button className="word" onClick={() => seek(word.start)}>{word.word}</button>{' '}</React.Fragment>) : row.text || <em>No usable text from the results received so far.</em>}</p>{row.alternates?.length > 0 && <details><summary>Other model drafts ({row.alternates.length})</summary>{row.alternates.map((alternate, index) => <div className="stage-preview-alternate" key={index}><small>{alternate.model} · {LANGUAGES[alternate.language] || alternate.language} · {Math.round((alternate.confidence || 0) * 100)}%</small><p>{alternate.text}</p></div>)}</details>}</div>
       <p>{row.translation_ready ? row.english || <em>No text to translate.</em> : <em>Translation not received yet.</em>}</p>
     </article>)}
     {!rows.length && <p className="stage-preview-empty">No matching text is available yet.</p>}
-    <div className="stage-preview-pagination"><Button disabled={current === 0} onClick={() => setPage(current - 1)}>Previous</Button><span>Page {current + 1} of {pages} · {rows.length} segments</span><Button disabled={current + 1 >= pages} onClick={() => setPage(current + 1)}>Next</Button></div>
+    <TranscriptPages page={current} count={rows.length} onChange={setPage}/>
   </section>;
 });
 
@@ -401,7 +478,7 @@ function Player({ id, recording, active, playerRef, initialTime, onTime, follow,
     })();
     return () => { cancelled = true; const saved = { ...playState.current }; ws.destroy(); media.removeAttribute('src'); media.load(); playState.current = saved; wavesurfer.current = null; playerRef.current = null; };
   }, [id, version]);
-  return <section className="player" aria-label="Audio player"><div className="player-top"><div className="player-source"><Icon name="volume" size={16}/><span>LISTENING COPY</span><div className="segmented"><button className={version === 'original' ? 'selected' : ''} onClick={() => setVersion('original')}>Original</button><button className={version === 'enhanced' ? 'selected' : ''} disabled={!enhanced} title={enhanced ? 'Listen to enhanced audio' : 'Available after enhancement finishes'} onClick={() => setVersion('enhanced')}>Enhanced</button></div></div><div className="player-options"><label><input type="checkbox" checked={follow} onChange={event => setFollow(event.target.checked)}/>Follow playback</label><button className={`text-button ${loop ? 'selected' : ''}`} disabled={!active} onClick={() => setLoop(!loop)} aria-pressed={loop}><Icon name="loop" size={16}/>Loop segment</button><select aria-label="Playback speed" value={speed} onChange={event => { const next = Number(event.target.value); setSpeed(next); playState.current.speed = next; wavesurfer.current?.setPlaybackRate(next); }}>{[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map(value => <option key={value} value={value}>{value}×</option>)}</select></div></div><div className="player-main"><button className="play-button" aria-label={playing ? 'Pause audio' : 'Play audio'} disabled={!ready} onClick={() => playerRef.current?.toggle()}><Icon name={playing ? 'pause' : 'play'} size={23}/></button><div className="waveform-wrap"><div className="waveform" ref={container}/>{!ready && !error && <span className="waveform-loading"><span className="spinner small"/>Preparing waveform…</span>}{error && <span className="waveform-error">{error}</span>}<div className="waveform-labels"><span>00:00</span><span>{time(length / 4)}</span><span>{time(length / 2)}</span><span>{time(length * 3 / 4)}</span><span>{time(length)}</span></div></div><div className="player-time"><strong>{time(position)}</strong><span>/ {time(length)}</span></div></div><div className="player-seek"><button className="text-button" disabled={!ready} onClick={() => playerRef.current?.seek(position - 2)}>−2 sec</button><input type="range" min="0" max={length || 1} step="0.1" value={Math.min(position, length || 1)} aria-label="Audio position" disabled={!ready} onChange={event => playerRef.current?.seek(Number(event.target.value))}/><button className="text-button" disabled={!ready} onClick={() => playerRef.current?.seek(position + 2)}>+2 sec</button></div></section>;
+  return <section className="player" aria-label="Audio player"><div className="player-top"><div className="player-source"><Icon name="volume" size={16}/><span>LISTENING COPY</span><div className="segmented"><button className={version === 'original' ? 'selected' : ''} onClick={() => setVersion('original')}>Original</button><button className={version === 'enhanced' ? 'selected' : ''} disabled={!enhanced} title={enhanced ? 'Listen to enhanced audio' : 'Available after enhancement finishes'} onClick={() => setVersion('enhanced')}>Enhanced</button></div></div><div className="player-options"><label><input type="checkbox" checked={follow} onChange={event => setFollow(event.target.checked)}/>Follow playback</label><button className={`text-button ${loop ? 'selected' : ''}`} disabled={!active} onClick={() => setLoop(!loop)} aria-pressed={loop}><Icon name="loop" size={16}/>Loop segment</button><select aria-label="Playback speed" value={speed} onChange={event => { const next = Number(event.target.value); setSpeed(next); playState.current.speed = next; wavesurfer.current?.setPlaybackRate(next); }}>{[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map(value => <option key={value} value={value}>{value}×</option>)}</select></div></div><div className="player-main"><button className="play-button" aria-label={playing ? 'Pause audio' : 'Play audio'} disabled={!ready} onClick={() => playerRef.current?.toggle()}><Icon name={playing ? 'pause' : 'play'} size={23}/></button><div className="waveform-wrap"><div className="waveform" ref={container}/>{!ready && !error && <span className="waveform-loading"><span className="spinner small"/>Preparing waveform…</span>}{error && <span className="waveform-error">{error}</span>}<div className="waveform-labels"><span>00:00</span><span>{time(length / 4)}</span><span>{time(length / 2)}</span><span>{time(length * 3 / 4)}</span><span>{time(length)}</span></div></div><div className="player-time"><strong>{time(position)}</strong><span>/ {time(length)}</span></div></div><div className="player-seek"><button className="text-button" disabled={!ready} onClick={() => playerRef.current?.seek(position - 5)}>−5 sec</button><input type="range" min="0" max={length || 1} step="0.1" value={Math.min(position, length || 1)} aria-label="Audio position" disabled={!ready} onChange={event => playerRef.current?.seek(Number(event.target.value))}/><button className="text-button" disabled={!ready} onClick={() => playerRef.current?.seek(position + 5)}>+5 sec</button></div></section>;
 }
 
 const SegmentRow = React.memo(function SegmentRow({ segment, speakers, active, currentTime, threshold, busy, handlers, canMerge }) {
@@ -438,7 +515,7 @@ function JobPanel({ recording, job, settings, busy, action }) {
 }
 
 function ConfirmDelete({ title, children, remove, close, busy }) { return <Modal title={title} close={close}><div className="modal-body"><p className="confirm-copy">{children}</p></div><div className="modal-footer"><span>This cannot be undone.</span><div className="button-group"><Button onClick={close} disabled={busy}>Keep it</Button><Button className="danger" icon="trash" busy={busy} onClick={remove}>Delete</Button></div></div></Modal>; }
-function ShortcutModal({ close }) { return <Modal title="A quicker way to review" subtitle="Keep your hands on the keyboard and your ears on the conversation." close={close}><div className="modal-body shortcut-list">{[['Tab', 'Play / pause (outside text fields)'], ['Ctrl + Enter', 'Mark reviewed and go to the next segment'], ['Alt + ← / →', 'Seek backward / forward 2 seconds'], ['Ctrl + J / K', 'Previous / next segment'], ['Ctrl + Shift + S', 'Split the selected segment at the text cursor'], ['Ctrl + M', 'Merge the selected segment with the next'], ['?', 'Open this help']].map(([key, description]) => <div key={key}><span>{description}</span><kbd>{key}</kbd></div>)}<p className="field-hint">Click a word to hear it. Double-click a text block or use Edit to correct it. Changes save automatically.</p></div></Modal>; }
+function ShortcutModal({ close }) { return <Modal title="A quicker way to review" subtitle="Keep your hands on the keyboard and your ears on the conversation." close={close}><div className="modal-body shortcut-list">{[['Tab', 'Play / pause (outside text fields)'], ['Ctrl + Enter', 'Mark reviewed and go to the next segment'], ['Alt + ← / →', 'Seek backward / forward 5 seconds'], ['Ctrl + Z', 'Undo the last saved edit (outside text fields)'], ['Ctrl + J / K', 'Previous / next segment'], ['Ctrl + Shift + S', 'Split the selected segment at the text cursor'], ['Ctrl + M', 'Merge the selected segment with the next'], ['?', 'Open this help']].map(([key, description]) => <div key={key}><span>{description}</span><kbd>{key}</kbd></div>)}<p className="field-hint">Click a word to hear it. Double-click a text block or use Edit to correct it. Changes save automatically.</p></div></Modal>; }
 function ExportModal({ recording, close, notify, flush }) {
   const [values, setValues] = useState({ format: 'docx', language: 'both', speakers: true, timestamps: true, anonymize: false, layout: 'columns', font_size: 11 });
   const [busy, setBusy] = useState(false), [previewUrl, setPreviewUrl] = useState(''), [loading, setLoading] = useState(true), [error, setError] = useState(''), [exactPdf, setExactPdf] = useState(false), [revision, setRevision] = useState(0);
@@ -514,7 +591,7 @@ function SpeakersModal({ recording, close, action }) {
 }
 function ReplaceModal({ id, close, action }) {
   const [values, setValues] = useState({ find: '', replace: '', field: 'both', case_sensitive: false }), [busy, setBusy] = useState(false), [result, setResult] = useState(null);
-  return <Modal title="Find & replace" subtitle="Correct recurring names or terms across this recording." close={close}><form onSubmit={async event => { event.preventDefault(); setBusy(true); const data = await action('replace', `/recordings/${id}/replace`, values, 'POST'); if (data) setResult(data); setBusy(false); }}><div className="modal-body"><label>Find<input required autoFocus value={values.find} onChange={event => { setValues({ ...values, find: event.target.value }); setResult(null); }} placeholder="Word or phrase to replace"/></label><label>Replace with<input value={values.replace} onChange={event => setValues({ ...values, replace: event.target.value })} placeholder="Replacement (leave blank to remove)"/></label><label>Apply to<select value={values.field} onChange={event => setValues({ ...values, field: event.target.value })}><option value="both">Original text and English translation</option><option value="original">Original text only</option><option value="english">English translation only</option></select></label><label className="checkbox-line"><input type="checkbox" checked={values.case_sensitive} onChange={event => setValues({ ...values, case_sensitive: event.target.checked })}/>Match letter case</label>{result && <div className="success-notice"><Icon name="check"/>{result.changed ?? result.updated ?? result.count ?? result.segments_updated ?? 'Matching'} segments updated.</div>}<p className="field-hint">Replacing original text marks its English translation as outdated. The original machine drafts are preserved.</p></div><div className="modal-footer"><Button onClick={close} type="button">Close</Button><Button type="submit" className="primary" busy={busy} disabled={!values.find}>Replace all matches</Button></div></form></Modal>;
+  return <Modal title="Find & replace" subtitle="Correct recurring names or terms across this recording." close={close}><form onSubmit={async event => { event.preventDefault(); setBusy(true); const data = await action('replace', `/recordings/${id}/replace`, values, 'POST'); if (data) setResult(data); setBusy(false); }}><div className="modal-body"><label>Find<input required autoFocus value={values.find} onChange={event => { setValues({ ...values, find: event.target.value }); setResult(null); }} placeholder="Word or phrase to replace"/></label><label>Replace with<input value={values.replace} onChange={event => setValues({ ...values, replace: event.target.value })} placeholder="Replacement (leave blank to remove)"/></label><label>Apply to<select value={values.field} onChange={event => setValues({ ...values, field: event.target.value })}><option value="both">Original text and English translation</option><option value="original">Original text only</option><option value="english">English translation only</option></select></label><label className="checkbox-line"><input type="checkbox" checked={values.case_sensitive} onChange={event => setValues({ ...values, case_sensitive: event.target.checked })}/>Match letter case</label>{result && <div className="success-notice"><Icon name="check"/>{result.replacements ?? result.count ?? 0} replacements saved. Undo is available after closing this dialog.</div>}<p className="field-hint">Replacing original text marks its English translation as outdated. The original machine drafts are preserved.</p></div><div className="modal-footer"><Button onClick={close} type="button">Close</Button><Button type="submit" className="primary" busy={busy} disabled={!values.find}>Replace all matches</Button></div></form></Modal>;
 }
 function SplitModal({ segment, position: initialPosition, time: splitTime, split, close }) {
   const text = segment.edited_text ?? segment.text ?? '';
@@ -556,4 +633,16 @@ function SettingsPage({ settings, onSave, notify }) {
 function NewTranscriptionModal({ close, create, notify }) {
   const [busy,setBusy]=useState(false);
   return <Modal title="Create a new transcription" subtitle="Run the current pipeline and compare its independent output." close={close}><div className="modal-body"><p>The original audio and compatible preparation checkpoints will be reused. Recognition, speaker assignment and translation will produce a separate transcript in your library.</p><p className="field-hint">This queues a complete processing run and uses your configured worker’s compute allowance. Your current transcript stays available for comparison.</p></div><div className="modal-footer"><Button onClick={close}>Cancel</Button><Button className="primary" busy={busy} onClick={async () => { setBusy(true); try { await create(); } catch(error) { notify(error.message,true); setBusy(false); } }}>Start new transcription</Button></div></Modal>;
+}
+
+function TranscriptPages({ page,count,onChange }) {
+  const pages=Math.max(1,Math.ceil(count/PAGE_SIZE)), [jump,setJump]=useState(String(page+1));
+  useEffect(() => setJump(String(page+1)),[page]);
+  const numbers=[...new Set([0,pages-1,page-2,page-1,page,page+1,page+2].filter(value => value>=0 && value<pages))].sort((a,b) => a-b);
+  return <nav className="transcript-pagination" aria-label="Transcript pages"><div className="page-buttons"><Button disabled={page===0} onClick={() => onChange(page-1)}>Previous</Button>{numbers.map((value,index) => <React.Fragment key={value}>{index>0 && value-numbers[index-1]>1 && <span className="page-ellipsis">…</span>}<button className={`page-number ${page===value ? 'selected' : ''}`} aria-current={page===value ? 'page' : undefined} aria-label={`Page ${value+1}`} onClick={() => onChange(value)}>{value+1}</button></React.Fragment>)}<Button disabled={page+1>=pages} onClick={() => onChange(page+1)}>Next</Button></div><div className="page-summary"><form className="page-jump" onSubmit={event => { event.preventDefault();const value=Number(jump);if (Number.isInteger(value) && value>=1 && value<=pages) onChange(value-1); }}><label>Page <input type="number" aria-label="Jump to page" min="1" max={pages} value={jump} onChange={event => setJump(event.target.value)}/></label><span>of {pages}</span><Button type="submit">Go</Button></form><span>Showing {count ? page*PAGE_SIZE+1 : 0}–{Math.min((page+1)*PAGE_SIZE,count)} of {count.toLocaleString()} matching segments · {PAGE_SIZE} per page</span></div></nav>;
+}
+function ScrollToTop() {
+  const [visible,setVisible]=useState(false);
+  useEffect(() => { const update=() => setVisible(window.scrollY>500);update();window.addEventListener('scroll',update,{passive:true});return () => window.removeEventListener('scroll',update); },[]);
+  return visible && <button className="scroll-to-top" aria-label="Scroll to top" title="Scroll to top" onClick={() => window.scrollTo({ top:0,behavior:window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })}><Icon name="up" size={20}/><span>Top</span></button>;
 }

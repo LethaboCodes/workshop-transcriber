@@ -704,10 +704,15 @@ def run_cpu(job, recording):
             result = retranscribe(recording_folder(recording.id), settings, snapshot, payload.get("language", snapshot["language"]), payload.get("model_key"))
         check_cancelled(job.id)
         with SessionLocal() as session:
+            session.connection().exec_driver_sql('BEGIN IMMEDIATE')
+            from .edits import job_edit
+            if not job_edit(session,job):
+                continue
             segment = session.get(Segment, segment_id)
             if not segment or segment.is_deleted:
                 continue
             if segment.revision != revision:
+                session.rollback()  # Release the editor lock before writing a separate log transaction.
                 log(job.id, f"Skipped segment {segment_id}: it was edited while this job ran. Run again to use the latest text.")
                 continue
             if job.kind == "translate":
