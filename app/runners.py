@@ -79,6 +79,12 @@ def check_cancelled(job_id):
             raise Cancelled("Cancelled locally.")
 
 
+def temporary_kaggle_error(error):
+    """Read requests may reconnect safely; never retry notebook creation here."""
+    from requests.exceptions import ConnectionError, Timeout, ChunkedEncodingError
+    return isinstance(error, (ConnectionError, Timeout, ChunkedEncodingError)) or http_status(error) in {429, 500, 502, 503, 504}
+
+
 def job_settings(recording):
     settings = dict(recording.settings or {})
     settings["original_path"] = str((DATA_DIR / recording.original_path).resolve())
@@ -238,9 +244,20 @@ def download_kaggle_artifacts(api, kernel_ref, output, folder, job_id):
     from .progress import preview_from_result
     def fetch(pattern):
         token = None
+        failures = 0
         while True:
-            _, token = api.kernels_output(kernel_ref, str(output), file_pattern=pattern,
-                                          force=True, quiet=True, page_token=token)
+            check_cancelled(job_id)
+            try:
+                _, token = api.kernels_output(kernel_ref, str(output), file_pattern=pattern,
+                                              force=True, quiet=True, page_token=token)
+                failures = 0
+            except Exception as exc:
+                if not temporary_kaggle_error(exc):
+                    raise
+                failures += 1
+                log(job_id, f"Kaggle output download connection interrupted; reconnecting to the same completed notebook (attempt {failures}). No new GPU run will be started.")
+                poll_wait(job_id, min(60, 15 * 2 ** min(2, failures - 1)))
+                continue
             if not token:
                 break
     # Make small, viewable results available before large audio/checkpoint files.
@@ -320,6 +337,7 @@ class KaggleRunner(JobRunner):
         remote_started = time.monotonic()
         remote_gpu = float(job.gpu_seconds or 0)
         remote_finished = False
+        remote_complete = False
         live_stream = None
         try:
             if not submitted:
@@ -405,10 +423,13 @@ class KaggleRunner(JobRunner):
                 except Exception as exc:
                     code = http_status(exc)
                     status_failures += 1
-                    if code not in {403, 404, 429, 500, 502, 503, 504} or status_failures >= 12:
+                    temporary = temporary_kaggle_error(exc)
+                    if not temporary and (code not in {403, 404} or status_failures >= 12):
                         raise
-                    log(job.id, f"Notebook status temporarily unavailable (HTTP {code}); retry {status_failures}/12 in 30 seconds.")
-                    poll_wait(job.id)
+                    detail = f"HTTP {code}" if code else "network connection"
+                    delay = min(60, 15 * 2 ** min(2,status_failures - 1))
+                    log(job.id, f"Notebook status unavailable ({detail}); reconnecting in {delay}s, attempt {status_failures}. The existing notebook continues independently; no new GPU run will be started.")
+                    poll_wait(job.id, delay)
                     continue
                 state = status_name(response)
                 if state != previous_state:
@@ -433,6 +454,7 @@ class KaggleRunner(JobRunner):
                         pass  # Some Kaggle versions expose logs only after completion.
                 if state in ("complete", "completed"):
                     remote_finished = True
+                    remote_complete = True
                     break
                 if state in ("error", "failed", "cancelled", "canceled", "cancel_acknowledged"):
                     remote_finished = True
@@ -454,7 +476,11 @@ class KaggleRunner(JobRunner):
                                 session.commit()
                     raise RuntimeError(f"Kaggle notebook {state}: {message}. Open its link for the full notebook log.")
                 poll_wait(job.id)
-            log(job.id, "Downloading transcript, enhanced audio and processing checkpoints.")
+            # Completed-stream replay must not overwrite download progress with
+            # historical transcription/translation messages.
+            if live_stream:
+                live_stream.close()
+            log(job.id, "Downloading completed transcript, enhanced audio and processing checkpoints.")
             try:
                 download_kaggle_artifacts(api, kernel_ref, output, folder, job.id)
             except Exception:
@@ -490,7 +516,7 @@ class KaggleRunner(JobRunner):
             with SessionLocal() as session:
                 live = session.get(Job, job.id)
                 if live:
-                    live.payload = {**(live.payload or {}), "resume_remote": submitted and not remote_finished,
+                    live.payload = {**(live.payload or {}), "resume_remote": submitted and (not remote_finished or remote_complete),
                                     "remote_finished": remote_finished}
                     session.commit()
             if created and (not submitted or remote_finished):
@@ -709,7 +735,7 @@ def dispatch(cpu=False):
                     continue
                 if not cpu and job.mode == "kaggle":
                     config = app_config(session)
-                    if config["gpu_hours"] >= float(config["weekly_gpu_limit"]):
+                    if not (job.kaggle_ref and (job.payload or {}).get("submitted")) and config["gpu_hours"] >= float(config["weekly_gpu_limit"]):
                         raise RuntimeError("The configured weekly GPU budget is used. Increase the limit in Settings or retry after usage ages out.")
                 job.status, job.step = "processing", "Starting"
                 job.started_at = job.started_at or utcnow()

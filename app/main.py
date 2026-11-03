@@ -524,6 +524,7 @@ def retry_job(job_id: str, session: Session = Depends(db)):
     job = enqueue_job(session, old.recording_id, old.kind, payload)
     if resume_remote:
         job.mode, job.kaggle_ref = "kaggle", old.kaggle_ref
+        job.gpu_seconds, job.started_at = old.gpu_seconds, old.started_at
     session.commit()
     return serialize_job(job)
 

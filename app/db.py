@@ -141,7 +141,12 @@ def app_config(session):
     config.update({row.key: row.value for row in session.scalars(select(AppSetting))})
     since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     jobs = session.scalars(select(Job).where(Job.started_at >= since)).all()
-    config["gpu_hours"] = sum(max(0, job.gpu_seconds or 0) for job in jobs) / 3600
+    usage = {}
+    for job in jobs:
+        # Reconnecting creates a local attempt, not another Kaggle execution.
+        key = ("kaggle",job.kaggle_ref) if job.mode=="kaggle" and job.kaggle_ref else ("job",job.id)
+        usage[key] = max(usage.get(key,0), max(0,job.gpu_seconds or 0))
+    config["gpu_hours"] = sum(usage.values()) / 3600
     config["credentials"] = {"hf_token": bool(os.getenv("HF_TOKEN")), "kaggle_username": bool(os.getenv("KAGGLE_USERNAME")), "kaggle_key": bool(os.getenv("KAGGLE_KEY"))}
     return config
 
