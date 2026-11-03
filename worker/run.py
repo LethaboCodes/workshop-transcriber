@@ -557,6 +557,7 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         if device == "cuda":
             gpu_seconds += time.monotonic() - stage_start
         from app.timeline import VERSION, windows, tracks, assemble, audit, recovery_windows, speech_overlap
+        from app.contextual_text import contextualize_rows,regroup_rows
         from app.progress import timeline_draft, publish_snapshot, publish_translation
         plan = windows(duration, regions, pipeline.get("core_seconds",24), pipeline.get("context_seconds",3))
         if audit(duration,plan,[],[],[],[])["input_coverage_gaps"]:
@@ -568,7 +569,9 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         preview = None
         def preview_ready(candidates, completed, total):
             nonlocal preview
-            rows,_ = assemble(tracks(plan,candidates),turns,duration,preferred,pipeline.get("language_probe_seconds",6))
+            lanes=tracks(plan,candidates)
+            rows,_ = assemble(lanes,turns,duration,preferred,pipeline.get("language_probe_seconds",6))
+            rows=regroup_rows(contextualize_rows(rows,lanes,preferred),lanes)
             preview = timeline_draft(rows,duration,completed,total,turns)
             publish_snapshot(folder,preview)
         stage_start = time.monotonic()
@@ -576,6 +579,7 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         candidates = recognize_segments(plan, selected_paths, checkpoint, enhancement_key,
                                         languages, {**settings,"_validation_index":validation_index}, device, temporary, publish=preview_ready)
         primary_lanes = tracks(plan,candidates)
+        all_lanes=primary_lanes
         segments,decisions = assemble(primary_lanes,turns,duration,preferred,pipeline.get("language_probe_seconds",6))
         initial_report = audit(duration,plan,candidates,segments,regions,turns)
         retry_plan,deferred = recovery_windows(initial_report,regions,pipeline.get("recovery_fraction",.25))
@@ -584,8 +588,10 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
             log("coverage", f"Detected {len(initial_report['issues'])} possible coverage/quality issues. Automatically checking {len(retry_plan)} shorter, shifted windows against original and enhanced audio; expensive preparation/enhancement is reused.")
             recovery_candidates = recognize_segments(retry_plan,audio_paths,checkpoint,enhancement_key,languages,
                 {**settings,"_recovery":True},device,temporary)
-            segments,decisions = assemble(primary_lanes + tracks(retry_plan,recovery_candidates,"recovery"),
-                turns,duration,preferred,pipeline.get("language_probe_seconds",6))
+            all_lanes=primary_lanes+tracks(retry_plan,recovery_candidates,"recovery")
+            segments,decisions = assemble(all_lanes,turns,duration,preferred,pipeline.get("language_probe_seconds",6))
+        log("reconcile","Resolving language and phrase context without changing recognition wording.")
+        segments=regroup_rows(contextualize_rows(segments,all_lanes,preferred),all_lanes)
         report = audit(duration,plan,candidates,segments,regions,turns)
         report.update(pipeline=pipeline,recognition_windows=len(plan),passes_per_audio=sum(len(choices_for(language)) for language in languages),
                       initial_issues=initial_report["issues"],recovery_windows=len(retry_plan),deferred_recovery=deferred,
@@ -601,6 +607,7 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         for segment in segments:
             if any(issue["start"] < segment["end"] and issue["end"] > segment["start"] for issue in report["issues"]):
                 segment["review_status"] = "flagged"
+            if segment.get("quality_flags"):segment["review_status"]="flagged"
             segment["recognition_pipeline"] = VERSION
         preview = timeline_draft(segments,duration,len(plan),len(plan),turns)
         publish_snapshot(folder,preview)
@@ -625,7 +632,7 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
                     "allowed_languages":languages,"asr_input":asr_input,"max_seconds":max_seconds,
                     "runtime":{name:package_version(name) for name in ("faster-whisper","ctranslate2","torch","pyannote.audio","silero-vad")}}
         manifest["code_fingerprint"] = fingerprint({name:(ROOT/name).read_text(encoding="utf-8-sig")
-            for name in ("worker/run.py","worker/asr.py","app/timeline.py","app/inference.py","app/checkpoints.py","app/translate.py","models.yaml")})
+            for name in ("worker/run.py","worker/asr.py","app/timeline.py","app/reconciliation.py","app/speaker_assignment.py","app/contextual_text.py","app/inference.py","app/checkpoints.py","app/translate.py","models.yaml")})
         result = {"duration": duration, "enhanced_path": "enhanced.m4a", "gpu_seconds": round(gpu_seconds, 3),
                   "speakers": [{"id": speaker, "name": "Unknown speaker" if speaker == "SPEAKER_UNKNOWN" else f"Speaker {index + 1}"}
                                for index, speaker in enumerate(speaker_ids)], "segments": segments,

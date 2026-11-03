@@ -17,7 +17,7 @@ _last_translation_write = 0
 
 
 def alternate_drafts(options):
-    return [{key: item.get(key) for key in ("text", "language", "model", "audio_version", "confidence")}
+    return [{key: item.get(key) for key in ("text", "language", "model", "audio_version", "confidence", "start", "end", "replaceable", "quality_flags")}
             for item in options]
 
 
@@ -54,11 +54,15 @@ def emit_event(event):
 
 def timeline_draft(segments, duration, completed, total, speaker_turns=()):
     """Window recognition is assembled before publishing speaker-labelled rows."""
-    rows = [{**row,"index":index,"english":row["text"] if row["language"]=="en" else "",
+    # Live previews carry viewing data only; full attribution/source provenance
+    # remains in result.json and must not multiply every live resource snapshot.
+    rows = [{**{key:value for key,value in row.items() if key not in {"source_rows","unresolved_alternates","language_context","translation_context","unresolved_spans"}},
+             "words":[{key:word.get(key) for key in ("word","start","end","probability")} for word in row.get("words",[])],
+             "index":index,"english":row["text"] if row["language"]=="en" else "",
              "translation_ready":row["language"]=="en","alternates":alternate_drafts(row.get("alternates",[]))}
             for index,row in enumerate(segments)]
     speakers = list(dict.fromkeys([*(row["speaker"] for row in rows),*(speaker for _,_,speaker in speaker_turns)]))
-    return {"version":2,"stage":"transcription","duration":duration,"recognition_done":completed,
+    return {"version":3,"stage":"transcription","duration":duration,"recognition_done":completed,
             "recognition_total":total,"segments":rows,
             "speakers":[{"id":speaker,"name":"Unknown speaker" if speaker=="SPEAKER_UNKNOWN" else f"Speaker {index+1}"}
                         for index,speaker in enumerate(speakers)]}
@@ -89,7 +93,7 @@ def read_preview(folder):
 
 def preview_from_result(folder, result):
     rows = [{"start": row["start"], "end": row["end"], "language": row.get("language", "en"),
-             "words": row.get("words", []), "model": row.get("model", ""), "confidence": row.get("confidence", 0),
+             "words": [{key:word.get(key) for key in ("word","start","end","probability")} for word in row.get("words",[])], "quality_flags":row.get("quality_flags",[]), "model": row.get("model", ""), "confidence": row.get("confidence", 0),
              "alternates": alternate_drafts(row.get("alternates", [])),
              "index": index, "speaker": row.get("speaker", row.get("speaker_id", "Unknown")),
              "text": row.get("text", row.get("machine_text", "")),

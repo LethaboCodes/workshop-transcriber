@@ -29,11 +29,11 @@ translation:
 diarization:
   id: pyannote/speaker-diarization-community-1
 pipeline:
-  version: full-coverage-v2
+  version: full-coverage-v3
   core_seconds: 24
   context_seconds: 3
   language_probe_seconds: 6
-  selection: evidence-consensus-v1
+  selection: span-consensus-v2
   recovery_fraction: 0.25
 vad:
   id: silero_vad

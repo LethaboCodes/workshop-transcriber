@@ -368,7 +368,7 @@ class KaggleRunner(JobRunner):
                     log(job.id, "Including saved processing checkpoints in the private input dataset.")
                 # Kaggle can expand files with a .zip extension on ingestion.
                 with zipfile.ZipFile(dataset / "source.bundle", "w", zipfile.ZIP_DEFLATED) as archive:
-                    for name in ("models.yaml", "worker/run.py", "worker/asr.py", "worker/runtime_cache.py", "worker/requirements.txt", "app/__init__.py", "app/inference.py", "app/translate.py", "app/checkpoints.py", "app/progress.py", "app/timeline.py"):
+                    for name in ("models.yaml", "worker/run.py", "worker/asr.py", "worker/runtime_cache.py", "worker/requirements.txt", "app/__init__.py", "app/inference.py", "app/translate.py", "app/checkpoints.py", "app/progress.py", "app/timeline.py", "app/reconciliation.py", "app/speaker_assignment.py", "app/contextual_text.py"):
                         archive.write(ROOT / name, name)
                 response = api.dataset_create_new(str(dataset), public=False, quiet=True, convert_to_csv=False)
                 error = getattr(response, "error", None)

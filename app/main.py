@@ -687,6 +687,7 @@ def merge_segment(segment_id: str, session: Session = Depends(db)):
         raise HTTPException(400, "There is no following segment to merge.")
     merged = derived_segment(segment, end=max(segment.end, following.end), edited_text=" ".join(filter(None, [segment.edited_text, following.edited_text])), machine_text=" ".join(filter(None, [segment.machine_text, following.machine_text])), machine_english=" ".join(filter(None, [segment.machine_english, following.machine_english])), edited_english=" ".join(filter(None, [segment.edited_english, following.edited_english])), words=list(segment.words or []) + list(following.words or []), alternates=[], english_outdated=segment.english_outdated or following.english_outdated, english_machine=segment.english_machine or following.english_machine)
     merged.machine_history += list(following.machine_history or []) + [draft_snapshot(following)]
+    merged.quality_flags=sorted(set(segment.quality_flags or [])|set(following.quality_flags or []))
     segment.is_deleted = following.is_deleted = True
     session.add(merged)
     reorder(session, segment.recording_id)
@@ -758,6 +759,8 @@ def choose_alternate(segment_id: str, data: dict = Body(...), session: Session =
     if index >= len(segment.alternates):
         raise HTTPException(400, "Alternate not found.")
     choice = segment.alternates[index]
+    if choice.get("replaceable") is False:
+        raise HTTPException(400,"This reference covers a different or unaligned span. It cannot replace this segment.")
     previous = {"text": segment.edited_text, "english": segment.edited_english, "language": segment.language, "model": segment.model, "audio_version": segment.audio_version, "words": segment.words, "confidence": segment.confidence, "source": "previous text"}
     segment.alternates = [previous] + [item for i, item in enumerate(segment.alternates) if i != index]
     segment.edited_text = choice.get("text", "")

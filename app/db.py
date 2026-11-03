@@ -103,6 +103,7 @@ class Segment(Base):
     english_machine = Column(Boolean, default=True)
     confidence = Column(Float, default=0)
     words = Column(JSON, default=list)
+    quality_flags = Column(JSON, default=list, nullable=False, server_default="[]")
     alternates = Column(JSON, default=list)
     review_status = Column(String, default="unreviewed")
     model = Column(String, default="")
@@ -133,6 +134,9 @@ def init_db():
     for index in Segment.__table__.indexes:
         index.create(engine,checkfirst=True)
     with engine.begin() as connection:
+        columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(segment)")}
+        if "quality_flags" not in columns:
+            connection.exec_driver_sql("ALTER TABLE segment ADD COLUMN quality_flags JSON NOT NULL DEFAULT '[]'")
         connection.exec_driver_sql("CREATE VIRTUAL TABLE IF NOT EXISTS segment_fts USING fts5(segment_id UNINDEXED, recording_id UNINDEXED, text, english, tokenize='unicode61')")
         existing = connection.exec_driver_sql("SELECT sql FROM sqlite_master WHERE name='segment_fts_update'").scalar() or ""
         if "old.rowid" not in existing:
@@ -290,6 +294,19 @@ def apply_retranscription(session, segment, result):
     session.flush()
 
 
+def result_quality_flags(item):
+    flags = item.get("quality_flags") or []
+    if isinstance(flags, str):
+        flags = [flags]
+    if not isinstance(flags, (list, tuple, set)):
+        flags = []
+    flags = {flag.strip() for flag in flags if isinstance(flag, str) and flag.strip()}
+    for flag in ("speaker_uncertain", "language_uncertain"):
+        if item.get(flag) is True:
+            flags.add(flag)
+    return sorted(flags)
+
+
 def import_result(recording_id, result, job_id=None):
     """Import an entire result atomically; never replace an already reviewed transcript."""
     with SessionLocal() as session:
@@ -319,7 +336,8 @@ def import_result(recording_id, result, job_id=None):
             english = str(item.get("english", item.get("machine_english", item.get("translation", ""))))
             language = item.get("language", "en")
             model = item.get("model", "")
-            segment = Segment(recording_id=recording_id, order=index, start=float(item["start"]), end=float(item["end"]), speaker_id=speakers[key], language=language, suggested_language=item.get("suggested_language", language), machine_text=text, edited_text=text, machine_english=english, edited_english=english, confidence=float(item.get("confidence") or 0), words=item.get("words") or [], alternates=item.get("alternates") or [], model=model, audio_version=item.get("audio_version", "original"), review_status="flagged" if item.get("review_status")=="flagged" else "unreviewed", machine_history=[{"text": text, "english": english, "model": model, "language": language, "source": "pipeline", "start": item["start"], "end": item["end"], "selection": item.get("selection"), "pipeline_version": result.get("pipeline_version", "baseline-v1")}])
+            flags = result_quality_flags(item)
+            segment = Segment(recording_id=recording_id, order=index, start=float(item["start"]), end=float(item["end"]), speaker_id=speakers[key], language=language, suggested_language=item.get("suggested_language", language), machine_text=text, edited_text=text, machine_english=english, edited_english=english, confidence=float(item.get("confidence") or 0), words=item.get("words") or [], quality_flags=flags, alternates=item.get("alternates") or [], model=model, audio_version=item.get("audio_version", "original"), review_status="flagged" if flags or item.get("review_status")=="flagged" else "unreviewed", machine_history=[{"text": text, "english": english, "model": model, "language": language, "source": "pipeline", "start": item["start"], "end": item["end"], "selection": item.get("selection"), "pipeline_version": result.get("pipeline_version", "baseline-v1")}])
             session.add(segment)
         recording.duration = float(result.get("duration") or max((float(s["end"]) for s in result.get("segments", [])), default=0))
         enhanced = result.get("enhanced_audio", result.get("enhanced_path", "enhanced.m4a"))
