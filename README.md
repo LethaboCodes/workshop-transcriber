@@ -46,3 +46,5 @@ When ASR uses original audio on CUDA, enhancement builds the listening copy alon
 See [LOCAL_TEST.md](LOCAL_TEST.md) for the clean manual upload test and deployment constraints.
 
 The recognition engine packages are pinned to the verified faster-whisper 1.2.1 / CTranslate2 4.8.4 pair. Each GPU subprocess limits auxiliary math-library threads to avoid oversubscribing the notebook CPUs. Native enhancement chunks have a ten-minute execution limit; failures retain already completed chunks.
+
+Free external access uses the optional Tailscale Funnel companion in [SHARING.md](SHARING.md). It preserves the local address and app password, and does not require installing a Windows VPN client. The computer and Docker Desktop must remain running for the shared website to be available.

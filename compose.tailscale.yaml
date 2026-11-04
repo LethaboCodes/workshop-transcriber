@@ -1,0 +1,27 @@
+services:
+  tailscale:
+    image: tailscale/tailscale:stable@sha256:ed6480b33c6eb67c9cbd203ed42b9fb57e361986725b6856def71b7a3d9e276c
+    network_mode: service:web
+    environment:
+      TS_HOSTNAME: workshop-transcriber
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_AUTH_ONCE: "true"
+      TS_BOOT_TIMEOUT: "30m"
+      TS_USERSPACE: "true"
+      TS_ACCEPT_DNS: "false"
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+    depends_on:
+      web:
+        condition: service_healthy
+        restart: true
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  tailscale-state:
+
