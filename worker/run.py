@@ -308,7 +308,8 @@ def run_asr_processes(task_path, device, count, validate=False, translation=Fals
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
     try:
         for shard in range(count):
-            environment = dict(os.environ)
+            from worker.cuda_runtime import library_environment
+            environment = library_environment(os.environ) if device == "cuda" and not translation else dict(os.environ)
             physical = visible[shard].strip() if len(visible) >= count and all(visible) else str(shard)
             environment["CUDA_VISIBLE_DEVICES"] = physical if device == "cuda" and not translation else ""
             environment["ASR_PHYSICAL_DEVICE"] = physical
@@ -632,7 +633,7 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
                     "allowed_languages":languages,"asr_input":asr_input,"max_seconds":max_seconds,
                     "runtime":{name:package_version(name) for name in ("faster-whisper","ctranslate2","torch","pyannote.audio","silero-vad")}}
         manifest["code_fingerprint"] = fingerprint({name:(ROOT/name).read_text(encoding="utf-8-sig")
-            for name in ("worker/run.py","worker/asr.py","app/timeline.py","app/reconciliation.py","app/speaker_assignment.py","app/contextual_text.py","app/inference.py","app/checkpoints.py","app/translate.py","models.yaml")})
+            for name in ("worker/run.py","worker/asr.py","worker/cuda_runtime.py","app/timeline.py","app/reconciliation.py","app/speaker_assignment.py","app/contextual_text.py","app/inference.py","app/checkpoints.py","app/translate.py","models.yaml")})
         result = {"duration": duration, "enhanced_path": "enhanced.m4a", "gpu_seconds": round(gpu_seconds, 3),
                   "speakers": [{"id": speaker, "name": "Unknown speaker" if speaker == "SPEAKER_UNKNOWN" else f"Speaker {index + 1}"}
                                for index, speaker in enumerate(speaker_ids)], "segments": segments,

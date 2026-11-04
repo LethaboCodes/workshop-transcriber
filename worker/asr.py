@@ -45,6 +45,8 @@ def run_task(task, shard, count, validate=False, translation=False):
     device = task["device"]
     label = f"{task['model_key']} shard {shard + 1}/{count}"
     if device == "cuda":
+        from worker.cuda_runtime import verify_libraries
+        library_handles = verify_libraries(emit)
         import ctranslate2
         if ctranslate2.get_cuda_device_count() != 1:
             raise RuntimeError("Each isolated ASR process must see exactly one GPU.")

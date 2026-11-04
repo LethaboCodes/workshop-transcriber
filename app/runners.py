@@ -368,7 +368,7 @@ class KaggleRunner(JobRunner):
                     log(job.id, "Including saved processing checkpoints in the private input dataset.")
                 # Kaggle can expand files with a .zip extension on ingestion.
                 with zipfile.ZipFile(dataset / "source.bundle", "w", zipfile.ZIP_DEFLATED) as archive:
-                    for name in ("models.yaml", "worker/run.py", "worker/asr.py", "worker/runtime_cache.py", "worker/requirements.txt", "app/__init__.py", "app/inference.py", "app/translate.py", "app/checkpoints.py", "app/progress.py", "app/timeline.py", "app/reconciliation.py", "app/speaker_assignment.py", "app/contextual_text.py"):
+                    for name in ("models.yaml", "worker/run.py", "worker/asr.py", "worker/runtime_cache.py", "worker/cuda_runtime.py", "worker/requirements.txt", "app/__init__.py", "app/inference.py", "app/translate.py", "app/checkpoints.py", "app/progress.py", "app/timeline.py", "app/reconciliation.py", "app/speaker_assignment.py", "app/contextual_text.py"):
                         archive.write(ROOT / name, name)
                 response = api.dataset_create_new(str(dataset), public=False, quiet=True, convert_to_csv=False)
                 error = getattr(response, "error", None)
@@ -622,10 +622,15 @@ def main():
         # The uv download cache duplicates installed wheels; retain only the
         # installed environment and model files in notebook outputs.
         shutil.rmtree(project/'uv-cache', ignore_errors=True)
+    from worker.cuda_runtime import library_environment
+    worker_env = library_environment(worker_env, [runtime['site']])
+    emit('[setup] Configured isolated NVIDIA shared-library search paths.')
     emit('[setup] Checking dependency compatibility.')
     run([*pip, 'check'], env=worker_env)
     emit('[setup] Checking model-library imports and GPU access before processing audio.')
     preflight = (
+        'import sys; sys.path.insert(0, '+repr(str(project)) +'); '
+        'from worker.cuda_runtime import verify_libraries; verify_libraries(); '
         'import torch, torchaudio, torchcodec, ctranslate2, numpy; '
         'from pyannote.audio import Pipeline; '
         'from silero_vad import load_silero_vad; '
