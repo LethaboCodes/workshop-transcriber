@@ -1,5 +1,7 @@
 """Lazy, CPU/int8 segment recognition; shared by the GPU worker."""
 import gc
+import hashlib
+from contextlib import contextmanager
 import json
 import logging
 import math
@@ -139,6 +141,53 @@ def _load_model(model_config, device):
     return model
 
 
+
+class ExactEncoderCache:
+    """Reuse only byte-identical features within one audio window."""
+    def __init__(self, encode, capacity=12):
+        self.encode = encode
+        self.capacity = capacity
+        self.entries = OrderedDict()
+        self.hits = self.misses = 0
+
+    def __call__(self, features):
+        import numpy as np
+        contiguous = np.ascontiguousarray(features)
+        key = (contiguous.shape, contiguous.dtype.str,
+               hashlib.sha256(memoryview(contiguous).cast("B")).digest())
+        if key in self.entries:
+            self.hits += 1
+            self.entries.move_to_end(key)
+            return self.entries[key]
+        value = self.encode(features)
+        self.misses += 1
+        self.entries[key] = value
+        while len(self.entries) > self.capacity:
+            self.entries.popitem(last=False)
+        return value
+
+    def clear(self):
+        self.entries.clear()
+
+
+@contextmanager
+def reuse_window_encoder(model_key, device):
+    """Keep the decoder untouched; release all cached tensors after this window."""
+    if device != "cuda" or os.getenv("ASR_REUSE_ENCODER", "1") == "0":
+        yield None
+        return
+    with _lock:
+        model = _load_model(config()["asr"][model_key], device)
+    original = model.encode
+    cache = ExactEncoderCache(original)
+    model.encode = cache
+    try:
+        yield cache
+    finally:
+        model.encode = original
+        cache.clear()
+
+
 def release_models():
     with _lock:
         _models.clear()
@@ -269,15 +318,45 @@ def acoustic_languages(audio, model_key, start_offset=0, device="cpu", seconds=6
         model = _load_model(model_config, device)
     result = []
     stride = max(1, round(seconds * 16000))
-    for offset in range(0,len(audio),stride):
-        clip = audio[offset:offset+stride]
-        if len(clip)<320:
-            continue
-        _, _, probabilities = model.detect_language(audio=clip, vad_filter=False)
-        lookup = dict(probabilities)
-        result.append({"start":round(start_offset+offset/16000,3),
-                       "end":round(start_offset+(offset+len(clip))/16000,3),
-                       "probabilities": {language:round(float(lookup[code]),6) for language,code in mapping.items() if code in lookup}})
+    probes = [(offset, audio[offset:offset + stride]) for offset in range(0, len(audio), stride)
+              if len(audio[offset:offset + stride]) >= 320]
+    batch_size = max(1,min(4,int(os.getenv("ASR_LANGUAGE_BATCH_SIZE","4" if device=="cuda" else "1"))))
+    if getattr(model,"_language_batch_disabled",False):
+        batch_size = 1
+    for index in range(0,len(probes),batch_size):
+        group = probes[index:index + batch_size]
+        probabilities = None
+        if batch_size > 1 and len(group)>1:
+            import numpy as np
+            from faster_whisper.audio import pad_or_trim
+            features = np.stack([pad_or_trim(model.feature_extractor(
+                clip[:model.feature_extractor.n_samples])[..., :model.feature_extractor.nb_max_frames])
+                for _,clip in group])
+            try:
+                encoded = model.encode(features)
+                scores = model.model.detect_language(encoded)
+                if len(scores)!=len(group):
+                    raise RuntimeError("Batched language detection returned an incomplete result.")
+                probabilities = [[(token[2:-2],probability) for token,probability in row] for row in scores]
+            except RuntimeError as exc:
+                if not any(term in str(exc).lower() for term in ("out of memory","failed to allocate","cuda_error_out_of_memory")):
+                    raise
+                model._language_batch_disabled=True
+                if isinstance(model.encode,ExactEncoderCache):
+                    model.encode.clear()
+                logging.getLogger(__name__).warning(
+                    "[setup] Language-probe batch exceeded GPU memory; retaining all probes sequentially.")
+            finally:
+                if "encoded" in locals():
+                    del encoded
+        if probabilities is None:
+            probabilities = [model.detect_language(audio=clip,vad_filter=False)[2] for _,clip in group]
+        for (offset,clip),scores in zip(group,probabilities):
+            lookup = dict(scores)
+            result.append({"start":round(start_offset+offset/16000,3),
+                           "end":round(start_offset+(offset+len(clip))/16000,3),
+                           "probabilities": {language:round(float(lookup[code]),6) for language,code in mapping.items() if code in lookup}})
+
     return result
 
 

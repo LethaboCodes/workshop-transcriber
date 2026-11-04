@@ -6,8 +6,8 @@ python-docx>=1.1,<2
 reportlab>=4.4,<5
 jiwer>=4,<5
 PyYAML>=6,<7
-faster-whisper>=1.1,<2
-ctranslate2>=4.5,<5
+faster-whisper==1.2.1
+ctranslate2==4.8.4
 huggingface-hub>=0.28,<1
 transformers>=4.48,<5
 sentencepiece>=0.2,<1

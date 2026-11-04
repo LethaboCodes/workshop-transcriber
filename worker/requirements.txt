@@ -7,8 +7,8 @@ torchcodec==0.7.0
 pyannote.audio>=4.0,<4.1
 silero-vad>=6,<7
 onnxruntime>=1.20,<2
-faster-whisper>=1.1,<2
-ctranslate2>=4.5,<5
+faster-whisper==1.2.1
+ctranslate2==4.8.4
 huggingface-hub>=0.28,<1
 transformers>=4.48,<5
 sentencepiece>=0.2,<1

@@ -41,7 +41,7 @@ def run_task(task, shard, count, validate=False, translation=False):
         return
     import soundfile as sf
     from app.checkpoints import cached_json
-    from app.inference import transcribe_audio, release_models, acoustic_languages, config
+    from app.inference import transcribe_audio, release_models, acoustic_languages, config, reuse_window_encoder
     device = task["device"]
     label = f"{task['model_key']} shard {shard + 1}/{count}"
     if device == "cuda":
@@ -59,38 +59,69 @@ def run_task(task, shard, count, validate=False, translation=False):
     if sampler:
         sampler.start()
     try:
-        for item in task["passes"]:
-            language, version = item["language"], item["version"]
-            folder = Path(item["checkpoint"])
-            indices = ([task.get("validation_index",0)] if validate and task["segments"]
-                       else [] if validate
-                       else range(shard, len(task["segments"]), count))
-            emit(f"[transcribe] {'Validating' if validate else 'Running'} {label}, {language}, {version}.")
-            with sf.SoundFile(item["audio"]) as audio:
+        # Process all languages for the same model/audio window together. The
+        # forced-language decoders, fallback temperatures and word alignment are
+        # unchanged; identical encoder inputs can share their computed tensor.
+        versions = list(dict.fromkeys(item["version"] for item in task["passes"]))
+        hits = misses = 0
+        for version in versions:
+            items = [item for item in task["passes"] if item["version"] == version]
+            indices = ([task.get("validation_index", 0)] if validate and task["segments"]
+                       else [] if validate else range(shard, len(task["segments"]), count))
+            emit(f"[transcribe] {'Validating' if validate else 'Running'} {label}, {version}, languages " +
+                 ", ".join(item["language"] for item in items) + ".")
+            with sf.SoundFile(items[0]["audio"]) as audio:
                 for index in indices:
                     if index is None:
                         continue
                     segment = task["segments"][index]
-                    def recognize():
+                    saved = {}
+                    if not validate:
+                        for item in items:
+                            path = Path(item["checkpoint"]) / f"{index:05d}.json"
+                            try:
+                                saved[item["language"]] = json.loads(path.read_text())
+                            except (OSError, ValueError):
+                                pass
+                    missing = [item for item in items if validate or item["language"] not in saved]
+                    if missing:
                         audio.seek(round(segment["start"] * 16000))
                         samples = audio.read(max(1, round((segment["end"] - segment["start"]) * 16000)), dtype="float32")
-                        candidate = transcribe_audio(samples, language, task["model_key"], version, segment["start"],
-                                                task.get("word_list", ""), device, segment["end"] - segment["start"],
-                                                coverage_mode=task.get("coverage_mode", False), recovery=task.get("recovery", False))
-                        if candidate is not None and task.get("coverage_mode") and config()["asr"][task["model_key"]].get("language_evidence_codes"):
-                            evidence, _ = cached_json(Path(item["evidence_checkpoint"]) / f"{index:05d}.json",
-                                lambda: acoustic_languages(samples, task["model_key"], segment["start"], device,
-                                                           task.get("language_probe_seconds",6)))
-                            candidate["language_evidence"] = evidence
-                        return candidate
-                    if validate:
-                        recognize()  # Always execute inference, even if this segment was checkpointed.
-                        emit(f"[setup] Real {label}/{language}/{version} model loading and inference passed.")
-                        gpu_sample(label + " validation passed")
-                    else:
-                        _, reused = cached_json(folder / f"{index:05d}.json", recognize)
-                        emit("[asr-progress] " + json.dumps({"index": index, "language": language,
-                                                            "version": version, "reused": reused}))
+                        if not len(samples):
+                            raise ValueError(f"Recognition window {index + 1} has no decodable samples.")
+                        with reuse_window_encoder(task["model_key"], device) as cache:
+                            for item in missing:
+                                language = item["language"]
+                                def recognize():
+                                    candidate = transcribe_audio(samples, language, task["model_key"], version, segment["start"],
+                                                        task.get("word_list", ""), device, segment["end"] - segment["start"],
+                                                        coverage_mode=task.get("coverage_mode", False), recovery=task.get("recovery", False))
+                                    if candidate is not None and task.get("coverage_mode") and config()["asr"][task["model_key"]].get("language_evidence_codes"):
+                                        def probe():
+                                            return acoustic_languages(samples, task["model_key"], segment["start"], device,
+                                                                      task.get("language_probe_seconds", 6))
+                                        # Validation runs the same window on both GPUs.
+                                        # It must not race over a shared checkpoint file.
+                                        evidence = probe() if validate else cached_json(
+                                            Path(item["evidence_checkpoint"]) / f"{index:05d}.json", probe)[0]
+                                        candidate["language_evidence"] = evidence
+                                    return candidate
+                                if validate:
+                                    recognize()
+                                    emit(f"[setup] Real {label}/{language}/{version} model loading and inference passed.")
+                                    gpu_sample(label + " validation passed")
+                                else:
+                                    cached_json(Path(item["checkpoint"]) / f"{index:05d}.json", recognize)
+                                    emit("[asr-progress] " + json.dumps({"index": index, "language": language,
+                                                                        "version": version, "reused": False}))
+                            if cache:
+                                hits += cache.hits
+                                misses += cache.misses
+                    if not validate:
+                        for language in saved:
+                            emit("[asr-progress] " + json.dumps({"index": index, "language": language,
+                                                                "version": version, "reused": True}))
+        emit(f"[performance] {label}: reused {hits} identical encoder calls; computed {misses}. Every language pass was retained.")
     finally:
         stop.set()
         if sampler:

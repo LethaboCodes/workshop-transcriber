@@ -5,3 +5,8 @@ data
 **/__pycache__
 **/node_modules
 frontend/dist
+
+test-audio
+
+.env.*
+!.env.example

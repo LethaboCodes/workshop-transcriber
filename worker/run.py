@@ -25,10 +25,13 @@ def log(step, message):
     print(f"[{step}] {message}", flush=True)
 
 
-def command(arguments):
+def command(arguments, timeout=None):
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    result = subprocess.run([str(arg) for arg in arguments], stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, creationflags=flags)
+    try:
+        result = subprocess.run([str(arg) for arg in arguments], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, creationflags=flags, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{Path(arguments[0]).name} exceeded its {timeout:.0f}-second limit; completed chunks are retained.") from exc
     if result.returncode:
         error = result.stderr.decode("utf-8", errors="replace")[-2500:]
         raise RuntimeError(f"{Path(arguments[0]).name} failed: {error}")
@@ -92,7 +95,7 @@ def valid_audio(path, seconds=None):
         return False
 
 
-def enhance(prepared, enhanced_wav, temporary, duration, settings):
+def enhance(prepared, enhanced_wav, temporary, duration, settings, cancel_event=None):
     import soundfile as sf
     from app.inference import cache_dir, config
     enhancement = config()["enhancement"]
@@ -123,6 +126,10 @@ def enhance(prepared, enhanced_wav, temporary, duration, settings):
     log("enhance", f"Processing {len(pending)} remaining chunks with {workers} CPU workers.")
 
     def process_chunk(index):
+        def check():
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("Enhancement stopped because another processing stage failed; completed chunks are retained.")
+        check()
         # Each task owns its scratch files; only a fully aligned chunk is committed.
         with tempfile.TemporaryDirectory(prefix="enhance-", dir=str(temporary)) as scratch:
             scratch = Path(scratch)
@@ -135,7 +142,9 @@ def enhance(prepared, enhanced_wav, temporary, duration, settings):
             noisy = scratch / "enhance-input.wav"
             audio_command("-ss", str(context_start), "-t", str(context_end - context_start), "-i", prepared,
                           "-af", "apad=pad_dur=0.1", "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", noisy)
-            command([executable, "--model", model, "--compensate-delay", "--output-dir", output_dir, noisy])
+            check()
+            command([executable, "--model", model, "--compensate-delay", "--output-dir", output_dir, noisy], timeout=600)
+            check()
             denoised = output_dir / noisy.name
             aligned = scratch / "enhance-aligned.wav"
             audio_command("-ss", str(start - context_start), "-i", denoised, "-af", "apad", "-t", str(end - start),
@@ -166,6 +175,64 @@ def enhance(prepared, enhanced_wav, temporary, duration, settings):
     assembled_path.replace(enhanced_wav)
     encode_enhanced(enhanced_wav)
     shutil.rmtree(chunks)
+
+
+
+def timed_call(timings, name, compute):
+    started = time.monotonic()
+    try:
+        return compute()
+    finally:
+        timings[name] = round(time.monotonic() - started, 3)
+        log("timing", f"{name}: {timings[name]:.1f} seconds.")
+
+
+class EnhancementTask:
+    """Original-audio recognition can proceed while its listening copy is built."""
+    def __init__(self, prepared, enhanced, temporary, duration, settings, timings, parallel, folder):
+        self.prepared, self.enhanced, self.temporary = prepared, enhanced, temporary
+        self.duration, self.settings, self.timings = duration, settings, timings
+        self.parallel = parallel
+        self.folder = folder
+        self.cancel = threading.Event()
+        self.pool = self.future = None
+        self.published = False
+
+    def compute(self):
+        if valid_audio(self.enhanced, self.duration):
+            log("resume", "Reusing completed enhanced audio; no enhancement chunks need to run.")
+            if not (self.enhanced.parent / "enhanced.m4a").is_file():
+                encode_enhanced(self.enhanced)
+        else:
+            timed_call(self.timings, "enhancement", lambda: enhance(
+                self.prepared, self.enhanced, self.temporary, self.duration, self.settings, self.cancel))
+        temporary = self.folder / "enhanced.publishing"
+        shutil.copyfile(self.enhanced.parent / "enhanced.m4a", temporary)
+        temporary.replace(self.folder / "enhanced.m4a")
+        self.published = True
+
+    def __enter__(self):
+        if self.parallel:
+            log("enhance", "Building the listening copy alongside original-audio analysis and recognition.")
+            self.pool = ThreadPoolExecutor(max_workers=1)
+            self.future = self.pool.submit(self.compute)
+        else:
+            self.compute()
+        return self
+
+    def check(self):
+        if self.future is not None and self.future.done():
+            self.future.result()  # Stop GPU work promptly if enhancement failed.
+
+    def wait(self):
+        if self.future is not None:
+            self.future.result()
+
+    def __exit__(self, kind, value, trace):
+        if kind is not None:
+            self.cancel.set()
+        if self.pool is not None:
+            self.pool.shutdown(wait=True, cancel_futures=True)
 
 
 def encode_enhanced(enhanced_wav):
@@ -300,7 +367,7 @@ def write_json(path, content):
     temporary.replace(path)
 
 
-def run_asr_processes(task_path, device, count, validate=False, translation=False, progress=None):
+def run_asr_processes(task_path, device, count, validate=False, translation=False, progress=None, check=None):
     """Only pipe readers use threads; each GPU model lives in its own process."""
     messages = queue.Queue()
     processes, readers = [], []
@@ -313,7 +380,8 @@ def run_asr_processes(task_path, device, count, validate=False, translation=Fals
             physical = visible[shard].strip() if len(visible) >= count and all(visible) else str(shard)
             environment["CUDA_VISIBLE_DEVICES"] = physical if device == "cuda" and not translation else ""
             environment["ASR_PHYSICAL_DEVICE"] = physical
-            environment["OMP_NUM_THREADS"] = "1"
+            for thread_limit in ("OMP_NUM_THREADS","OPENBLAS_NUM_THREADS","MKL_NUM_THREADS","NUMEXPR_NUM_THREADS"):
+                environment[thread_limit] = "1"
             arguments = [sys.executable, "-u", str(ROOT / "worker/asr.py"), str(task_path),
                          "--shard", str(shard), "--count", str(count)]
             if validate:
@@ -333,7 +401,14 @@ def run_asr_processes(task_path, device, count, validate=False, translation=Fals
             reader.start()
             readers.append(reader)
         ended = set()
+        timeout = max(60, float(os.getenv("ASR_STALL_TIMEOUT", "1200")))
+        last_progress = {index: time.monotonic() for index in range(len(processes))}
         while len(ended) < len(processes):
+            if check:
+                check()
+            for stalled in set(range(len(processes))) - ended:
+                if time.monotonic() - last_progress[stalled] > timeout:
+                    raise RuntimeError(f"ASR worker {stalled + 1} saved no inference progress for {timeout / 60:.0f} minutes. Retry keeps completed hypotheses. Check GPU/network logs above.")
             try:
                 index, line = messages.get(timeout=0.5)
             except queue.Empty:
@@ -345,9 +420,12 @@ def run_asr_processes(task_path, device, count, validate=False, translation=Fals
                     detail = failures.get(index, "see its traceback above")
                     raise RuntimeError(f"Isolated {'translation' if translation else 'ASR'} worker {index + 1} exited with code {code}: {detail}. Completed hypotheses remain checkpointed.")
             elif line.startswith("[asr-progress] "):
+                last_progress[index] = time.monotonic()
                 if progress:
                     progress(json.loads(line[len("[asr-progress] "):]))
             else:
+                if line.startswith("[setup] Real "):
+                    last_progress[index] = time.monotonic()
                 if line.startswith(("RuntimeError:", "ValueError:", "ImportError:", "ModuleNotFoundError:", "OSError:", "KeyError:")):
                     failures[index] = line.strip()
                 print(line.rstrip(), flush=True)
@@ -365,7 +443,7 @@ def run_asr_processes(task_path, device, count, validate=False, translation=Fals
             reader.join(timeout=1)
 
 
-def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, settings, device, temporary, publish=None):
+def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, settings, device, temporary, publish=None, check=None):
     import ctranslate2
     from app.checkpoints import fingerprint, recognition_key
     from app.inference import choices_for, config
@@ -430,11 +508,11 @@ def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, 
         translation_task = temporary / "translation-validation.json"
         write_json(translation_task, {"languages": languages})
         log("setup", "Checking real translation inference before remaining recognition work.")
-        run_asr_processes(translation_task, "cpu", 1, translation=True)
+        run_asr_processes(translation_task, "cpu", 1, translation=True, check=check)
     # Validate every remaining model on each actual GPU before any long pass.
     for path, group in pending:
         log("setup", f"Validating {group['model_key']} on each isolated worker with real recording audio.")
-        run_asr_processes(path, device, count, validate=True)
+        run_asr_processes(path, device, count, validate=True, check=check)
     done, computed = cached_count, 0
     started = last_report = time.monotonic()
     def progress(event):
@@ -451,7 +529,7 @@ def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, 
             last_report = now
     for path, group in pending:
         log("transcribe", f"Starting fresh processes for {group['model_key']}.")
-        run_asr_processes(path, device, count, progress=progress)
+        run_asr_processes(path, device, count, progress=progress, check=check)
         candidates = collect()
     if completed_count != total:
         raise RuntimeError(f"Only {completed_count}/{total} window hypotheses were saved. Retry will resume the missing work.")
@@ -483,6 +561,8 @@ def finish_translations(segments, enabled, checkpoint, catalog, folder, preview)
 
 def run(folder, settings, max_seconds=None, prepare_only=False):
     folder = Path(folder).resolve()
+    started = time.monotonic()
+    timings = {}
     os.environ["RESOURCE_RUN_ID"] = settings.get("_resource_run_id", "worker")
     if not folder.is_dir():
         raise ValueError("The recording folder does not exist.")
@@ -524,7 +604,7 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
             log("resume", f"Reusing prepared audio ({duration:.2f} seconds).")
         else:
             pending = checkpoint / "prepared.partial.wav"
-            duration = prepare(original, pending, max_seconds)
+            duration = timed_call(timings,"audio_preparation",lambda:prepare(original,pending,max_seconds))
             pending.replace(prepared)
         if prepare_only:
             destination = folder / "prepared-sample.wav"
@@ -557,102 +637,107 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         enhancement = checkpoint / ("enhance-" + enhancement_key)
         enhancement.mkdir(exist_ok=True)
         enhanced_wav = enhancement / "enhanced.wav"
-        if valid_audio(enhanced_wav, duration):
-            log("resume", "Reusing completed enhanced audio; no enhancement chunks need to run.")
-            if not (enhancement / "enhanced.m4a").is_file():
-                encode_enhanced(enhanced_wav)
-        else:
-            enhance(prepared, enhanced_wav, temporary, duration, settings)
-        shutil.copyfile(enhancement / "enhanced.m4a", folder / "enhanced.m4a")
-        audio_paths = {"original": prepared, "enhanced": enhanced_wav}
-        selected_paths = audio_paths if asr_input == "both" else {asr_input: audio_paths[asr_input]}
-        vad_key = fingerprint(["vad-v1", asr_input, enhancement_key if asr_input != "original" else None, catalog["vad"]])
-        regions, reused = cached_json(checkpoint / f"vad-{vad_key}.json", lambda: speech_regions(selected_paths, duration))
-        if reused:
-            log("resume", f"Reusing {len(regions)} detected speech regions.")
-        gpu_seconds = 0.0
-        stage_start = time.monotonic()
-        diarization_key = fingerprint(["speakers-v1", catalog["diarization"], settings.get("min_speakers"), settings.get("max_speakers"), device])
-        turns, reused = (cached_json(checkpoint / f"speakers-{diarization_key}.json",
-                                    lambda: diarize(prepared, settings, device)) if duration > 0 else ([], False))
-        if reused:
-            log("resume", "Reusing completed speaker diarization.")
-        if device == "cuda":
-            gpu_seconds += time.monotonic() - stage_start
-        from app.timeline import VERSION, windows, tracks, assemble, audit, recovery_windows, speech_overlap
-        from app.contextual_text import contextualize_rows,regroup_rows
-        from app.progress import timeline_draft, publish_snapshot
-        plan = windows(duration, regions, pipeline.get("core_seconds",24), pipeline.get("context_seconds",3))
-        if audit(duration,plan,[],[],[],[])["input_coverage_gaps"]:
-            raise RuntimeError("Recognition planner left uncovered input audio.")
-        plan_key = fingerprint([VERSION,pipeline,regions,duration])
-        write_json(checkpoint / f"timeline-plan-{plan_key}.json", plan)
-        log("segment", f"Full-timeline plan: {len(plan)} overlapping windows; all {duration:.2f} seconds eligible for every model pass. Speaker turns do not cut recognition audio.")
-        preferred = {language: choices_for(language)[0] for language in languages}
-        preview = None
-        def preview_ready(candidates, completed, total):
-            nonlocal preview
-            lanes=tracks(plan,candidates)
-            rows,_ = assemble(lanes,turns,duration,preferred,pipeline.get("language_probe_seconds",6))
-            rows=regroup_rows(contextualize_rows(rows,lanes,preferred),lanes)
-            preview = timeline_draft(rows,duration,completed,total,turns,translation_enabled=settings.get("translate_on_complete",False))
+        parallel = asr_input == "original" and device == "cuda"
+        with EnhancementTask(prepared, enhanced_wav, temporary, duration, settings, timings, parallel, folder) as enhancement_task:
+            if not parallel:
+                enhancement_task.wait()
+            audio_paths = {"original": prepared, "enhanced": enhanced_wav}
+            selected_paths = audio_paths if asr_input == "both" else {asr_input: audio_paths[asr_input]}
+            vad_key = fingerprint(["vad-v1", asr_input, enhancement_key if asr_input != "original" else None, catalog["vad"]])
+            regions, reused = cached_json(checkpoint / f"vad-{vad_key}.json", lambda: timed_call(timings,"speech_detection",lambda:speech_regions(selected_paths,duration)))
+            if reused:
+                log("resume", f"Reusing {len(regions)} detected speech regions.")
+            gpu_seconds = 0.0
+            stage_start = time.monotonic()
+            diarization_key = fingerprint(["speakers-v1", catalog["diarization"], settings.get("min_speakers"), settings.get("max_speakers"), device])
+            turns, reused = (cached_json(checkpoint / f"speakers-{diarization_key}.json",
+                                        lambda: timed_call(timings,"speaker_diarization",lambda:diarize(prepared,settings,device))) if duration > 0 else ([], False))
+            if reused:
+                log("resume", "Reusing completed speaker diarization.")
+            if device == "cuda":
+                gpu_seconds += time.monotonic() - stage_start
+            from app.timeline import VERSION, windows, tracks, assemble, audit, recovery_windows, speech_overlap
+            from app.contextual_text import contextualize_rows,regroup_rows
+            from app.progress import timeline_draft, publish_snapshot
+            plan = windows(duration, regions, pipeline.get("core_seconds",24), pipeline.get("context_seconds",3))
+            if audit(duration,plan,[],[],[],[])["input_coverage_gaps"]:
+                raise RuntimeError("Recognition planner left uncovered input audio.")
+            plan_key = fingerprint([VERSION,pipeline,regions,duration])
+            write_json(checkpoint / f"timeline-plan-{plan_key}.json", plan)
+            log("segment", f"Full-timeline plan: {len(plan)} overlapping windows; all {duration:.2f} seconds eligible for every model pass. Speaker turns do not cut recognition audio.")
+            preferred = {language: choices_for(language)[0] for language in languages}
+            preview = None
+            def preview_ready(candidates, completed, total):
+                nonlocal preview
+                lanes=tracks(plan,candidates)
+                rows,_ = assemble(lanes,turns,duration,preferred,pipeline.get("language_probe_seconds",6))
+                rows=regroup_rows(contextualize_rows(rows,lanes,preferred),lanes)
+                preview = timeline_draft(rows,duration,completed,total,turns,translation_enabled=settings.get("translate_on_complete",False))
+                publish_snapshot(folder,preview)
+            stage_start = time.monotonic()
+            validation_index = max(range(len(plan)),key=lambda index:speech_overlap(plan[index]["start"],plan[index]["end"],regions))
+            candidates = timed_call(timings,"primary_recognition",lambda:recognize_segments(
+                plan,selected_paths,checkpoint,enhancement_key,languages,
+                {**settings,"_validation_index":validation_index},device,temporary,publish=preview_ready,check=enhancement_task.check))
+            enhancement_task.wait()
+            primary_lanes = tracks(plan,candidates)
+            all_lanes=primary_lanes
+            segments,decisions = assemble(primary_lanes,turns,duration,preferred,pipeline.get("language_probe_seconds",6))
+            initial_report = audit(duration,plan,candidates,segments,regions,turns)
+            retry_plan,deferred = recovery_windows(initial_report,regions,pipeline.get("recovery_fraction",.25))
+            recovery_candidates = []
+            if retry_plan:
+                log("coverage", f"Detected {len(initial_report['issues'])} possible coverage/quality issues. Automatically checking {len(retry_plan)} shorter, shifted windows against original and enhanced audio; expensive preparation/enhancement is reused.")
+                recovery_candidates = timed_call(timings,"recovery_recognition",lambda:recognize_segments(
+                    retry_plan,audio_paths,checkpoint,enhancement_key,languages,
+                    {**settings,"_recovery":True},device,temporary,check=enhancement_task.check))
+                all_lanes=primary_lanes+tracks(retry_plan,recovery_candidates,"recovery")
+                segments,decisions = assemble(all_lanes,turns,duration,preferred,pipeline.get("language_probe_seconds",6))
+            log("reconcile","Resolving language and phrase context without changing recognition wording.")
+            segments=regroup_rows(contextualize_rows(segments,all_lanes,preferred),all_lanes)
+            report = audit(duration,plan,candidates,segments,regions,turns)
+            report.update(pipeline=pipeline,recognition_windows=len(plan),passes_per_audio=sum(len(choices_for(language)) for language in languages),
+                          initial_issues=initial_report["issues"],recovery_windows=len(retry_plan),deferred_recovery=deferred,
+                          selection_decisions=decisions,selection_changes=sum(x["changed"] for x in decisions),
+                          ambiguous_selections=sum(x.get("ambiguous",False) for x in decisions),
+                          recovery_limit_seconds=round(min(duration,max(60,duration*pipeline.get("recovery_fraction",.25))),3))
+            write_json(folder / "coverage.json",report)
+            write_json(checkpoint / f"coverage-{plan_key}.json",report)
+            log("coverage", f"All input audio was submitted to every primary pass. Speech evidence without words: {initial_report['speech_without_words_seconds']:.1f}s before recovery, {report['speech_without_words_seconds']:.1f}s after. {len(deferred)} intervals exceeded the recovery budget; {report['ambiguous_selections']} language cells remain ambiguous. See coverage.json.")
+            if device == "cuda":
+                gpu_seconds += time.monotonic() - stage_start
+                torch.cuda.empty_cache()
+            for segment in segments:
+                if any(issue["start"] < segment["end"] and issue["end"] > segment["start"] for issue in report["issues"]):
+                    segment["review_status"] = "flagged"
+                if segment.get("quality_flags"):segment["review_status"]="flagged"
+                segment["recognition_pipeline"] = VERSION
+            preview = timeline_draft(segments,duration,len(plan),len(plan),turns,translation_enabled=settings.get("translate_on_complete",False))
             publish_snapshot(folder,preview)
-        stage_start = time.monotonic()
-        validation_index = max(range(len(plan)),key=lambda index:speech_overlap(plan[index]["start"],plan[index]["end"],regions))
-        candidates = recognize_segments(plan, selected_paths, checkpoint, enhancement_key,
-                                        languages, {**settings,"_validation_index":validation_index}, device, temporary, publish=preview_ready)
-        primary_lanes = tracks(plan,candidates)
-        all_lanes=primary_lanes
-        segments,decisions = assemble(primary_lanes,turns,duration,preferred,pipeline.get("language_probe_seconds",6))
-        initial_report = audit(duration,plan,candidates,segments,regions,turns)
-        retry_plan,deferred = recovery_windows(initial_report,regions,pipeline.get("recovery_fraction",.25))
-        recovery_candidates = []
-        if retry_plan:
-            log("coverage", f"Detected {len(initial_report['issues'])} possible coverage/quality issues. Automatically checking {len(retry_plan)} shorter, shifted windows against original and enhanced audio; expensive preparation/enhancement is reused.")
-            recovery_candidates = recognize_segments(retry_plan,audio_paths,checkpoint,enhancement_key,languages,
-                {**settings,"_recovery":True},device,temporary)
-            all_lanes=primary_lanes+tracks(retry_plan,recovery_candidates,"recovery")
-            segments,decisions = assemble(all_lanes,turns,duration,preferred,pipeline.get("language_probe_seconds",6))
-        log("reconcile","Resolving language and phrase context without changing recognition wording.")
-        segments=regroup_rows(contextualize_rows(segments,all_lanes,preferred),all_lanes)
-        report = audit(duration,plan,candidates,segments,regions,turns)
-        report.update(pipeline=pipeline,recognition_windows=len(plan),passes_per_audio=sum(len(choices_for(language)) for language in languages),
-                      initial_issues=initial_report["issues"],recovery_windows=len(retry_plan),deferred_recovery=deferred,
-                      selection_decisions=decisions,selection_changes=sum(x["changed"] for x in decisions),
-                      ambiguous_selections=sum(x.get("ambiguous",False) for x in decisions),
-                      recovery_limit_seconds=round(min(duration,max(60,duration*pipeline.get("recovery_fraction",.25))),3))
-        write_json(folder / "coverage.json",report)
-        write_json(checkpoint / f"coverage-{plan_key}.json",report)
-        log("coverage", f"All input audio was submitted to every primary pass. Speech evidence without words: {initial_report['speech_without_words_seconds']:.1f}s before recovery, {report['speech_without_words_seconds']:.1f}s after. {len(deferred)} intervals exceeded the recovery budget; {report['ambiguous_selections']} language cells remain ambiguous. See coverage.json.")
-        if device == "cuda":
-            gpu_seconds += time.monotonic() - stage_start
-            torch.cuda.empty_cache()
-        for segment in segments:
-            if any(issue["start"] < segment["end"] and issue["end"] > segment["start"] for issue in report["issues"]):
-                segment["review_status"] = "flagged"
-            if segment.get("quality_flags"):segment["review_status"]="flagged"
-            segment["recognition_pipeline"] = VERSION
-        preview = timeline_draft(segments,duration,len(plan),len(plan),turns,translation_enabled=settings.get("translate_on_complete",False))
-        publish_snapshot(folder,preview)
-        finish_translations(segments,settings.get("translate_on_complete",False),checkpoint,catalog,folder,preview)
-        speaker_ids = list(dict.fromkeys(segment["speaker"] for segment in segments))
-        from importlib.metadata import version as package_version
-        manifest = {"pipeline":pipeline,"source_key":input_key,"models":catalog["asr"],
-                    "allowed_languages":languages,"asr_input":asr_input,"max_seconds":max_seconds,
-                    "runtime":{name:package_version(name) for name in ("faster-whisper","ctranslate2","torch","pyannote.audio","silero-vad")}}
-        manifest["code_fingerprint"] = fingerprint({name:(ROOT/name).read_text(encoding="utf-8-sig")
-            for name in ("worker/run.py","worker/asr.py","worker/cuda_runtime.py","app/timeline.py","app/reconciliation.py","app/speaker_assignment.py","app/contextual_text.py","app/inference.py","app/checkpoints.py","app/translate.py","models.yaml")})
-        result = {"duration": duration, "enhanced_path": "enhanced.m4a", "gpu_seconds": round(gpu_seconds, 3),
-                  "speakers": [{"id": speaker, "name": "Unknown speaker" if speaker == "SPEAKER_UNKNOWN" else f"Speaker {index + 1}"}
-                               for index, speaker in enumerate(speaker_ids)], "segments": segments,
-                  "device": device, "partial_sample": bool(max_seconds), "pipeline_version": VERSION,
-                  "translation_enabled":settings.get("translate_on_complete",False), "coverage": report,
-                  "recognition_manifest": manifest}
-        write_json(folder / "result.json", result)
-        preview["stage"] = "finalizing"
-        publish_snapshot(folder, preview)
-        log("complete", f"Saved {len(segments)} segments and enhanced audio; translation {'enabled' if settings.get('translate_on_complete',False) else 'not requested'}; {gpu_seconds:.1f} estimated GPU seconds.")
-        return result
+            timed_call(timings,"optional_translation",lambda:finish_translations(
+                segments,settings.get("translate_on_complete",False),checkpoint,catalog,folder,preview))
+            speaker_ids = list(dict.fromkeys(segment["speaker"] for segment in segments))
+            from importlib.metadata import version as package_version
+            manifest = {"pipeline":pipeline,"source_key":input_key,"models":catalog["asr"],
+                        "allowed_languages":languages,"asr_input":asr_input,"max_seconds":max_seconds,
+                        "runtime":{name:package_version(name) for name in ("faster-whisper","ctranslate2","torch","pyannote.audio","silero-vad")}}
+            manifest["code_fingerprint"] = fingerprint({name:(ROOT/name).read_text(encoding="utf-8-sig")
+                for name in ("worker/run.py","worker/asr.py","worker/cuda_runtime.py","app/timeline.py","app/reconciliation.py","app/speaker_assignment.py","app/contextual_text.py","app/inference.py","app/checkpoints.py","app/translate.py","models.yaml")})
+            result = {"duration": duration, "enhanced_path": "enhanced.m4a", "gpu_seconds": round(gpu_seconds, 3),
+                      "speakers": [{"id": speaker, "name": "Unknown speaker" if speaker == "SPEAKER_UNKNOWN" else f"Speaker {index + 1}"}
+                                   for index, speaker in enumerate(speaker_ids)], "segments": segments,
+                      "device": device, "partial_sample": bool(max_seconds), "pipeline_version": VERSION,
+                      "translation_enabled":settings.get("translate_on_complete",False), "coverage": report,
+                      "stage_seconds":timings,"worker_seconds":round(time.monotonic()-started,3),
+                      "execution":{"encoder_reuse":device=="cuda" and os.getenv("ASR_REUSE_ENCODER","1")!="0",
+                                   "language_probe_batch_limit":max(1,min(4,int(os.getenv("ASR_LANGUAGE_BATCH_SIZE","4" if device=="cuda" else "1")))),
+                                   "enhancement_overlap":parallel},
+                      "recognition_manifest": manifest}
+            write_json(folder / "result.json", result)
+            preview["stage"] = "finalizing"
+            publish_snapshot(folder, preview)
+            log("complete", f"Saved {len(segments)} segments and enhanced audio; translation {'enabled' if settings.get('translate_on_complete',False) else 'not requested'}; {gpu_seconds:.1f} estimated GPU seconds.")
+            return result
 
 
 def main():

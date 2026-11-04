@@ -81,6 +81,14 @@ def finish(state, emit, budget=14 * 1024 ** 3):
         # Never advertise dependencies that failed import/GPU preflight.
         remove_directory(cache, cache.parent)
         return
+    # Caches are optional. Never fill the disk before final transcript/checkpoint
+    # publication just to duplicate a large Python environment.
+    packages = physical_size(state["site"])
+    reserve = 2 * 1024 ** 3
+    if shutil.disk_usage(cache).free < packages * 1.02 + reserve:
+        emit("[setup] Skipping optional runtime cache: insufficient free disk space; transcript/checkpoints take priority.")
+        remove_directory(cache, cache.parent)
+        return
     emit("[setup] Publishing isolated dependencies to private notebook outputs.")
     # One uncompressed archive avoids CPU-heavy compression and thousands of
     # paginated Kaggle output-list requests. It stays within Kaggle on reuse.
