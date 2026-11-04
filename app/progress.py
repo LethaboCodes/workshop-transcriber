@@ -52,17 +52,17 @@ def emit_event(event):
                                     "sha256": checksum, "data": chunk}), flush=True)
 
 
-def timeline_draft(segments, duration, completed, total, speaker_turns=()):
+def timeline_draft(segments, duration, completed, total, speaker_turns=(), translation_enabled=False):
     """Window recognition is assembled before publishing speaker-labelled rows."""
     # Live previews carry viewing data only; full attribution/source provenance
     # remains in result.json and must not multiply every live resource snapshot.
     rows = [{**{key:value for key,value in row.items() if key not in {"source_rows","unresolved_alternates","language_context","translation_context","unresolved_spans"}},
              "words":[{key:word.get(key) for key in ("word","start","end","probability")} for word in row.get("words",[])],
-             "index":index,"english":row["text"] if row["language"]=="en" else "",
-             "translation_ready":row["language"]=="en","alternates":alternate_drafts(row.get("alternates",[]))}
+             "index":index,"english":"",
+             "translation_ready":False,"alternates":alternate_drafts(row.get("alternates",[]))}
             for index,row in enumerate(segments)]
     speakers = list(dict.fromkeys([*(row["speaker"] for row in rows),*(speaker for _,_,speaker in speaker_turns)]))
-    return {"version":3,"stage":"transcription","duration":duration,"recognition_done":completed,
+    return {"version":3,"stage":"transcription","translation_enabled":translation_enabled,"duration":duration,"recognition_done":completed,
             "recognition_total":total,"segments":rows,
             "speakers":[{"id":speaker,"name":"Unknown speaker" if speaker=="SPEAKER_UNKNOWN" else f"Speaker {index+1}"}
                         for index,speaker in enumerate(speakers)]}
@@ -97,9 +97,10 @@ def preview_from_result(folder, result):
              "alternates": alternate_drafts(row.get("alternates", [])),
              "index": index, "speaker": row.get("speaker", row.get("speaker_id", "Unknown")),
              "text": row.get("text", row.get("machine_text", "")),
-             "english": row.get("english", row.get("machine_english", "")), "translation_ready": True}
+             "english": row.get("english", row.get("machine_english", "")),
+             "translation_ready":row.get("translation_ready",bool(row.get("english",row.get("machine_english",""))))}
             for index, row in enumerate(result.get("segments", []))]
-    preview = {"version": 1, "source": "download", "stage": "finalizing", "segments": rows,
+    preview = {"version": 1, "source": "download", "stage": "finalizing", "segments": rows,"translation_enabled":result.get("translation_enabled",True),
                "speakers": result.get("speakers", []), "duration": result.get("duration", 0),
                "recognition_done": len(rows), "recognition_total": len(rows), "updated_at": time.time()}
     save_json(Path(folder) / "preview.json", preview)

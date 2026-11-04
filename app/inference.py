@@ -46,7 +46,7 @@ def check_model_access(settings):
         for key in choices_for(language):
             model = catalog["asr"][key]
             resources.append((model["id"], model.get("language_map_file", "config.json")))
-    if any(language != "en" for language in languages):
+    if settings.get("translate_on_complete",False) and any(language != "en" for language in languages):
         translation = catalog["translation"]
         resources.append((translation["id"], "config.json"))
         if translation.get("ct2_id"):
@@ -300,7 +300,6 @@ def recording_audio(folder, settings, version):
 
 
 def retranscribe(recording_folder, settings, segment, language, model_key=None):
-    from app.translate import translate
     start, end = float(segment["start"]), float(segment["end"])
     versions = ["original", "enhanced"] if settings.get("asr_input", "original") == "both" else [settings.get("asr_input", "original")]
     clips = {version: extract_audio(recording_audio(recording_folder, settings, version), start, end)
@@ -316,6 +315,9 @@ def retranscribe(recording_folder, settings, segment, language, model_key=None):
         raise ValueError("No usable speech was recognized. Try another model, audio version, or segment boundary.")
     candidates.sort(key=lambda item: item["confidence"], reverse=True)
     selected = candidates[0].copy()
-    selected["english"] = translate(selected["text"], language)
+    selected["english"] = ""
+    if settings.get("translate_on_complete",False):
+        from app.translate import translate
+        selected["english"] = translate(selected["text"],language)
     selected["alternates"] = candidates[1:]
     return selected

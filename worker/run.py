@@ -426,7 +426,7 @@ def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, 
         completed_count = completed
         return candidates
     candidates = collect()
-    if segments:
+    if segments and settings.get("translate_on_complete",False) and any(language!="en" for language in languages):
         translation_task = temporary / "translation-validation.json"
         write_json(translation_task, {"languages": languages})
         log("setup", "Checking real translation inference before remaining recognition work.")
@@ -456,6 +456,29 @@ def recognize_segments(segments, paths, checkpoint, enhancement_key, languages, 
     if completed_count != total:
         raise RuntimeError(f"Only {completed_count}/{total} window hypotheses were saved. Retry will resume the missing work.")
     return candidates
+
+
+
+def finish_translations(segments, enabled, checkpoint, catalog, folder, preview):
+    """Only an explicit opt-in loads the translator or writes its checkpoints."""
+    if enabled:
+        from app.translate import translate
+        from app.checkpoints import cached_json,fingerprint
+        from app.progress import publish_translation
+    else:
+        log("complete","Recognition finished. Optional English translation was not requested.")
+    for index,segment in enumerate(segments):
+        english=""
+        if enabled:
+            key=fingerprint(["translation-v1",segment["text"],segment["language"],catalog["translation"]])
+            english,_=cached_json(checkpoint/"translations"/f"{key}.json",
+                                 lambda:translate(segment["text"],segment["language"]))
+            publish_translation(folder,preview,index,english)
+            log("translate",f"Translated segment {index+1}/{len(segments)} to English.")
+        segment.update(start=round(segment["start"],3),end=round(segment["end"],3),
+                       suggested_language=segment["language"],
+                       machine_text=segment["text"],machine_english=english,english=english,
+                       english_machine_generated=bool(enabled),translation_ready=bool(enabled))
 
 
 def run(folder, settings, max_seconds=None, prepare_only=False):
@@ -515,7 +538,6 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         import soundfile as sf
         import torch
         from app.inference import choices_for
-        from app.translate import translate
         requested = settings.get("device", "auto")
         device = ("cuda" if torch.cuda.is_available() and ctranslate2.get_cuda_device_count() else "cpu") if requested == "auto" else requested
         if device not in {"cpu", "cuda"}:
@@ -559,7 +581,7 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
             gpu_seconds += time.monotonic() - stage_start
         from app.timeline import VERSION, windows, tracks, assemble, audit, recovery_windows, speech_overlap
         from app.contextual_text import contextualize_rows,regroup_rows
-        from app.progress import timeline_draft, publish_snapshot, publish_translation
+        from app.progress import timeline_draft, publish_snapshot
         plan = windows(duration, regions, pipeline.get("core_seconds",24), pipeline.get("context_seconds",3))
         if audit(duration,plan,[],[],[],[])["input_coverage_gaps"]:
             raise RuntimeError("Recognition planner left uncovered input audio.")
@@ -573,7 +595,7 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
             lanes=tracks(plan,candidates)
             rows,_ = assemble(lanes,turns,duration,preferred,pipeline.get("language_probe_seconds",6))
             rows=regroup_rows(contextualize_rows(rows,lanes,preferred),lanes)
-            preview = timeline_draft(rows,duration,completed,total,turns)
+            preview = timeline_draft(rows,duration,completed,total,turns,translation_enabled=settings.get("translate_on_complete",False))
             publish_snapshot(folder,preview)
         stage_start = time.monotonic()
         validation_index = max(range(len(plan)),key=lambda index:speech_overlap(plan[index]["start"],plan[index]["end"],regions))
@@ -610,23 +632,9 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
                 segment["review_status"] = "flagged"
             if segment.get("quality_flags"):segment["review_status"]="flagged"
             segment["recognition_pipeline"] = VERSION
-        preview = timeline_draft(segments,duration,len(plan),len(plan),turns)
+        preview = timeline_draft(segments,duration,len(plan),len(plan),turns,translation_enabled=settings.get("translate_on_complete",False))
         publish_snapshot(folder,preview)
-        for index, segment in enumerate(segments):
-            winner = segment
-            language = winner["language"]
-            translation_key = fingerprint(["translation-v1", winner["text"], language, catalog["translation"]])
-            english, reused = cached_json(checkpoint / "translations" / f"{translation_key}.json",
-                                         lambda: translate(winner["text"], language))
-            publish_translation(folder, preview, index, english)
-            segment.update({"start": round(segment["start"], 3), "end": round(segment["end"], 3),
-                            "language": language, "suggested_language": language,
-                            "machine_text": winner["text"], "text": winner["text"],
-                            "machine_english": english, "english": english, "english_machine_generated": True,
-                            "confidence": winner["confidence"], "words": winner["words"],
-                            "alternates": winner["alternates"], "model": winner["model"],
-                            "audio_version": winner["audio_version"]})
-            log("translate", f"Translated segment {index + 1}/{len(segments)} to English.")
+        finish_translations(segments,settings.get("translate_on_complete",False),checkpoint,catalog,folder,preview)
         speaker_ids = list(dict.fromkeys(segment["speaker"] for segment in segments))
         from importlib.metadata import version as package_version
         manifest = {"pipeline":pipeline,"source_key":input_key,"models":catalog["asr"],
@@ -637,12 +645,13 @@ def run(folder, settings, max_seconds=None, prepare_only=False):
         result = {"duration": duration, "enhanced_path": "enhanced.m4a", "gpu_seconds": round(gpu_seconds, 3),
                   "speakers": [{"id": speaker, "name": "Unknown speaker" if speaker == "SPEAKER_UNKNOWN" else f"Speaker {index + 1}"}
                                for index, speaker in enumerate(speaker_ids)], "segments": segments,
-                  "device": device, "partial_sample": bool(max_seconds), "pipeline_version": VERSION, "coverage": report,
+                  "device": device, "partial_sample": bool(max_seconds), "pipeline_version": VERSION,
+                  "translation_enabled":settings.get("translate_on_complete",False), "coverage": report,
                   "recognition_manifest": manifest}
         write_json(folder / "result.json", result)
         preview["stage"] = "finalizing"
         publish_snapshot(folder, preview)
-        log("complete", f"Saved {len(segments)} segments, enhanced audio, and {gpu_seconds:.1f} estimated GPU seconds.")
+        log("complete", f"Saved {len(segments)} segments and enhanced audio; translation {'enabled' if settings.get('translate_on_complete',False) else 'not requested'}; {gpu_seconds:.1f} estimated GPU seconds.")
         return result
 
 

@@ -68,3 +68,8 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .segment-diagnostics{display:flex;flex-direction:column;align-items:flex-start;gap:5px;margin-top:8px}.segment-diagnostic{display:inline-flex;align-items:flex-start;gap:4px;padding:3px 5px;border:1px solid #b69a6a;border-radius:4px;background:#fff3dc;color:#654916;font-size:10px;line-height:1.35;max-width:100%;text-align:left}.segment-diagnostic svg{flex-shrink:0;margin-top:1px}
 
 .alternate.reference-draft>div{flex-wrap:wrap}.alternate .alternate-reference{flex-basis:100%;font-size:11px;font-weight:600;color:#425c70;padding:4px 7px;background:#edf2f7;border:1px solid #9aabba;border-radius:4px;line-height:1.4}
+
+.translation-setting>span{display:flex;align-items:center;gap:8px;line-height:1.6}.translation-setting input{width:auto}.stage-translation-toggle{padding:8px 24px;display:flex;align-items:center;gap:12px;font-size:12px;color:#435a46}.editor-tools{flex-wrap:wrap}.editor-tools>.button{min-height:32px;font-size:11px;padding:7px 10px}
+@media(min-width:651px){.translations-hidden .transcript-head,.translations-hidden .segment-row{grid-template-columns:135px minmax(210px,1fr) 65px}.translations-hidden .stage-preview-columns,.translations-hidden .stage-preview-row{grid-template-columns:145px minmax(0,1fr)}}
+@media(min-width:1550px){.translations-hidden .transcript-head,.translations-hidden .segment-row{grid-template-columns:155px minmax(290px,1fr) 80px}}
+@media(max-width:650px){.stage-translation-toggle{padding:8px 16px;flex-wrap:wrap}.editor-tools>.button{font-size:10px;padding:6px 8px}}

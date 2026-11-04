@@ -18,7 +18,7 @@ from urllib.parse import quote, urlsplit
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select, text as sql_text, tuple_
+from sqlalchemy import func, select, text as sql_text, tuple_
 from sqlalchemy.orm import Session, defer
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
@@ -106,7 +106,7 @@ def db(request: Request):
         session.info['editor_delta']=request.query_params.get('editor_delta')=='1'
         if request.method in {'POST','PATCH','DELETE'}:
             path=request.url.path
-            if path.startswith(('/api/segments/','/api/speakers/')) or (path.startswith('/api/recordings/') and (request.method=='PATCH' or path.endswith(('/segments','/speakers','/replace','/translate-outdated')))):
+            if path.startswith(('/api/segments/','/api/speakers/')) or (path.startswith('/api/recordings/') and (request.method=='PATCH' or path.endswith(('/segments','/speakers','/replace','/translate-outdated','/translate')))):
                 from . import edits
                 action=path.rsplit('/',1)[-1]
                 session.info['edit_label']= {'merge':'Merge segments' if '/segments/' in path else 'Merge speakers','split':'Split segment','replace':'Find and replace','translate':'Translate text','translate-outdated':'Translate outdated text','retranscribe':'Re-transcribe text','choose-alternate':'Choose alternate text','segments':'Add segment','speakers':'Add speaker'}.get(action,
@@ -175,10 +175,12 @@ def language_code(value):
 
 
 def recording_settings(value):
-    settings = {"allowed_languages": ["en", "xh", "af"], "min_speakers": None, "max_speakers": None, "asr_input": "original", "word_list": [], "redaction_list": []}
+    settings = {"allowed_languages": ["en", "xh", "af"], "min_speakers": None, "max_speakers": None, "asr_input": "original", "word_list": [], "redaction_list": [], "translate_on_complete": False}
     if not isinstance(value, dict):
         raise HTTPException(400, "Recording settings must be an object.")
     settings.update(value)
+    if not isinstance(settings["translate_on_complete"],bool):
+        raise HTTPException(400,"Translate after transcription must be true or false.")
     settings["allowed_languages"] = list(dict.fromkeys(language_code(item) for item in settings["allowed_languages"]))
     if not settings["allowed_languages"]:
         raise HTTPException(400, "Choose at least one allowed language.")
@@ -327,7 +329,7 @@ def coverage_report(recording_id: str, session: Session = Depends(db)):
 
 
 @app.post("/api/recordings/{recording_id}/transcriptions")
-def new_transcription(recording_id: str, session: Session = Depends(db)):
+def new_transcription(recording_id: str, data: dict = Body(default={}), session: Session = Depends(db)):
     """An independent output; only immutable compatible preparation files are reused."""
     from .inference import config
     source=get_recording(session,recording_id)
@@ -336,7 +338,7 @@ def new_transcription(recording_id: str, session: Session = Depends(db)):
         raise HTTPException(400,"The original audio is not available yet.")
     version=config().get("pipeline",{}).get("version","baseline-v1")
     recording=Recording(title=f"{source.title} - {version}",notes=source.notes,workshop=source.workshop,date=source.date,
-                        duration=source.duration,settings={**(source.settings or {}),"source_recording_id":source.id},
+                        duration=source.duration,settings=recording_settings({**(source.settings or {}),"source_recording_id":source.id,**({"translate_on_complete":data["translate_on_complete"]} if "translate_on_complete" in data else {})}),
                         filename=source.filename,size=source.size,status="queued")
     session.add(recording);session.flush()
     folder=recording_folder(recording.id)
@@ -603,8 +605,6 @@ def patch_segment(segment_id: str, data: dict = Body(...), session: Session = De
         if data["review_status"] not in {"unreviewed", "reviewed", "flagged"}:
             raise HTTPException(400, "Invalid review status.")
         segment.review_status = data["review_status"]
-        if segment.review_status == "reviewed":
-            segment.english_machine = False
     if "speaker_id" in data:
         speaker_id = data["speaker_id"] or None
         if speaker_id and get_speaker(session, speaker_id).recording_id != segment.recording_id:
@@ -741,6 +741,24 @@ def translate_segment(segment_id: str, session: Session = Depends(db)):
     return edit_response(session,segment.recording_id,{"job": serialize_job(job,include_log=False)})
 
 
+@app.post("/api/recordings/{recording_id}/translate")
+def translate_missing(recording_id: str, session: Session = Depends(db)):
+    recording=get_recording(session,recording_id)
+    if recording.status!="ready":
+        raise HTTPException(409,"Translation is available after transcription finishes.")
+    ids=list(session.scalars(select(Segment.id).where(Segment.recording_id==recording_id,
+        Segment.is_deleted==False,func.trim(Segment.edited_english)=="")))
+    active=session.scalars(select(Job).where(Job.recording_id==recording_id,Job.kind=="translate",
+        Job.status.in_(["queued","processing","running"]))).all()
+    queued={sid for job in active for sid in (job.payload or {}).get("segment_ids",[])}
+    ids=[sid for sid in ids if sid not in queued]
+    if not ids:
+        return edit_response(session,recording_id,{"job":serialize_job(active[0],include_log=False) if active else None,"count":0})
+    job=enqueue_job(session,recording_id,"translate",{"segment_ids":ids})
+    session.commit()
+    return edit_response(session,recording_id,{"job":serialize_job(job,include_log=False),"count":len(ids)})
+
+
 @app.post("/api/recordings/{recording_id}/translate-outdated")
 def translate_outdated(recording_id: str, session: Session = Depends(db)):
     get_recording(session, recording_id)
@@ -778,7 +796,8 @@ def choose_alternate(segment_id: str, data: dict = Body(...), session: Session =
         segment.english_outdated = False
     else:
         segment.english_outdated = True
-        enqueue_job(session, segment.recording_id, "translate", {"segment_ids": [segment.id]})
+        if (get_recording(session,segment.recording_id).settings or {}).get("translate_on_complete",False):
+            enqueue_job(session, segment.recording_id, "translate", {"segment_ids": [segment.id]})
     session.commit()
     return edit_response(session,segment.recording_id,serialize_segment(segment,compact=True))
 

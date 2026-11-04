@@ -269,7 +269,7 @@ def download_kaggle_artifacts(api, kernel_ref, output, folder, job_id):
     preview_file = next(iter(output.rglob("preview.json")), None)
     if result_file:
         preview_from_result(folder, json.loads(result_file.read_text(encoding="utf-8")))
-        log(job_id, "Complete transcript and translations are available to preview/export while remaining files download.")
+        log(job_id, "Complete transcript and any requested translations are available to preview/export while remaining files download.")
     elif preview_file:
         from .checkpoints import save_json
         save_json(folder / "preview.json", json.loads(preview_file.read_text(encoding="utf-8")))
