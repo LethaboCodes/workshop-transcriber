@@ -85,4 +85,6 @@ The sharing-proxy companion compresses transcript JSON and frontend assets befor
 sending them through Funnel. It listens only on loopback port 8001 in the app's
 network namespace and forwards to the unchanged app on port 8000. It has no
 recording-data or credential mounts. Audio range requests, cookies and save
-requests pass through; responses are not cached. Funnel targets port 8001.
+requests pass through. Transcript/API responses are not cached; successful audio
+responses permit five minutes of private browser caching to reuse range requests.
+The proxy itself stores no response cache. Funnel targets port 8001.
