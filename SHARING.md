@@ -36,7 +36,7 @@ Open the Tailscale authentication URL and finish connecting `workshop-transcribe
 Use your free personal account. Then enable the app's public HTTPS route:
 
 ```powershell
-docker compose -f compose.yaml -f compose.tailscale.yaml exec -T tailscale tailscale funnel --bg --yes 8000
+docker compose -f compose.yaml -f compose.tailscale.yaml exec -T tailscale tailscale funnel --bg --yes 8001
 ```
 
 If Tailscale provides a separate feature-approval URL, complete that in your
@@ -73,8 +73,16 @@ docker compose -f compose.yaml -f compose.tailscale.yaml up --build -d
 If the web container was recreated separately, reconnect its companion with:
 
 ```powershell
-docker compose -f compose.yaml -f compose.tailscale.yaml up -d --no-deps --force-recreate tailscale
+docker compose -f compose.yaml -f compose.tailscale.yaml up -d --no-deps --force-recreate sharing-proxy tailscale
 ```
 
 The same identity and background Funnel route are retained in the state volume.
 No worker or application-code changes are needed for sharing.
+
+## Faster recording opening
+
+The sharing-proxy companion compresses transcript JSON and frontend assets before
+sending them through Funnel. It listens only on loopback port 8001 in the app's
+network namespace and forwards to the unchanged app on port 8000. It has no
+recording-data or credential mounts. Audio range requests, cookies and save
+requests pass through; responses are not cached. Funnel targets port 8001.

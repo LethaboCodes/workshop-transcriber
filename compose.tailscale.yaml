@@ -1,4 +1,28 @@
 services:
+  sharing-proxy:
+    image: nginx:stable-alpine@sha256:e9b2d7624fd7957f4ed44ae0a272d93fb73aeb8512ba8916f8118ae6143fd115
+    network_mode: service:web
+    volumes:
+      - ./sharing-proxy.conf:/etc/nginx/nginx.conf:ro
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    depends_on:
+      web:
+        condition: service_healthy
+        restart: true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
   tailscale:
     image: tailscale/tailscale:stable@sha256:ed6480b33c6eb67c9cbd203ed42b9fb57e361986725b6856def71b7a3d9e276c
     network_mode: service:web
@@ -13,6 +37,9 @@ services:
       - tailscale-state:/var/lib/tailscale
     depends_on:
       web:
+        condition: service_healthy
+        restart: true
+      sharing-proxy:
         condition: service_healthy
         restart: true
     restart: unless-stopped
